@@ -46,6 +46,7 @@ solana-runtime = { path = "../runtime", version = "=1.9.0" }
 solana-sdk = { path = "../sdk", version = "=1.9.0" }
 solana-send-transaction-service = { path = "../send-transaction-service", version = "=1.9.0" }
 solana-streamer = { path = "../streamer", version = "=1.9.0" }
+solana-test-validator = { path = "../test-validator", version = "=1.9.0" }
 solana-version = { path = "../version", version = "=1.9.0" }
 solana-vote-program = { path = "../programs/vote", version = "=1.9.0" }
 symlink = "0.1.0"
@@ -55,7 +56,7 @@ jemallocator = {package = "tikv-jemallocator", version = "0.4.1", features = ["u
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.105"
-signal-hook = "0.2.3"
+signal-hook = "0.3.10"
 sysctl = "0.4.2"
 
 [package.metadata.docs.rs]

@@ -3118,8 +3118,11 @@ impl Bank {
         &self.fee_rate_governor
     }
 
-    pub fn get_fee_for_message(&self, message: &SanitizedMessage) -> u64 {
-        Self::calculate_fee(message, self.fee_rate_governor.lamports_per_signature)
+    pub fn get_fee_for_message(&self, message: &SanitizedMessage) -> Option<u64> {
+        let blockhash_queue = self.blockhash_queue.read().unwrap();
+        let lamports_per_signature =
+            blockhash_queue.get_lamports_per_signature(message.recent_blockhash())?;
+        Some(Self::calculate_fee(message, lamports_per_signature))
     }
 
     pub fn get_fee_for_message_with_lamports_per_signature(
@@ -3246,21 +3249,17 @@ impl Bank {
         tick_height % self.ticks_per_slot == 0
     }
 
-    /// Prepare a transaction batch from a list of legacy transactionsy. Used for tests only.
-    pub fn prepare_batch(&self, txs: Vec<Transaction>) -> Result<TransactionBatch> {
+    /// Prepare a transaction batch from a list of legacy transactions. Used for tests only.
+    pub fn prepare_batch_for_tests(&self, txs: Vec<Transaction>) -> TransactionBatch {
         let sanitized_txs = txs
             .into_iter()
-            .map(SanitizedTransaction::try_from)
-            .collect::<Result<Vec<_>>>()?;
+            .map(SanitizedTransaction::from_transaction_for_tests)
+            .collect::<Vec<_>>();
         let lock_results = self
             .rc
             .accounts
             .lock_accounts(sanitized_txs.iter(), self.demote_program_write_locks());
-        Ok(TransactionBatch::new(
-            lock_results,
-            self,
-            Cow::Owned(sanitized_txs),
-        ))
+        TransactionBatch::new(lock_results, self, Cow::Owned(sanitized_txs))
     }
 
     /// Prepare a transaction batch from a list of versioned transactions from
@@ -4550,6 +4549,34 @@ impl Bank {
         Self::get_partitions(self.slot(), self.parent_slot(), slot_count_in_two_day)
     }
 
+    /// used only by filler accounts in debug path
+    /// previous means slot - 1, not parent
+    pub fn variable_cycle_partition_from_previous_slot(
+        epoch_schedule: &EpochSchedule,
+        slot: Slot,
+    ) -> Partition {
+        // similar code to Bank::variable_cycle_partitions
+        let (current_epoch, current_slot_index) = epoch_schedule.get_epoch_and_slot_index(slot);
+        let (parent_epoch, mut parent_slot_index) =
+            epoch_schedule.get_epoch_and_slot_index(slot.saturating_sub(1));
+        let cycle_params = Self::rent_single_epoch_collection_cycle_params(
+            current_epoch,
+            epoch_schedule.get_slots_in_epoch(current_epoch),
+        );
+
+        if parent_epoch < current_epoch {
+            parent_slot_index = 0;
+        }
+
+        let generated_for_gapped_epochs = false;
+        Self::get_partition_from_slot_indexes(
+            cycle_params,
+            parent_slot_index,
+            current_slot_index,
+            generated_for_gapped_epochs,
+        )
+    }
+
     fn variable_cycle_partitions(&self) -> Vec<Partition> {
         let (current_epoch, current_slot_index) = self.get_epoch_and_slot_index(self.slot());
         let (parent_epoch, mut parent_slot_index) =
@@ -4600,6 +4627,20 @@ impl Bank {
         generated_for_gapped_epochs: bool,
     ) -> Partition {
         let cycle_params = self.determine_collection_cycle_params(epoch);
+        Self::get_partition_from_slot_indexes(
+            cycle_params,
+            start_slot_index,
+            end_slot_index,
+            generated_for_gapped_epochs,
+        )
+    }
+
+    fn get_partition_from_slot_indexes(
+        cycle_params: RentCollectionCycleParams,
+        start_slot_index: SlotIndex,
+        end_slot_index: SlotIndex,
+        generated_for_gapped_epochs: bool,
+    ) -> Partition {
         let (_, _, in_multi_epoch_cycle, _, _, partition_count) = cycle_params;
 
         // use common codepath for both very likely and very unlikely for the sake of minimized
@@ -4669,18 +4710,26 @@ impl Bank {
         self.do_partition_from_slot_indexes(start_slot_index, end_slot_index, epoch, true)
     }
 
+    fn rent_single_epoch_collection_cycle_params(
+        epoch: Epoch,
+        slot_count_per_epoch: SlotCount,
+    ) -> RentCollectionCycleParams {
+        (
+            epoch,
+            slot_count_per_epoch,
+            false,
+            0,
+            1,
+            slot_count_per_epoch,
+        )
+    }
+
     fn determine_collection_cycle_params(&self, epoch: Epoch) -> RentCollectionCycleParams {
         let slot_count_per_epoch = self.get_slots_in_epoch(epoch);
 
         if !self.use_multi_epoch_collection_cycle(epoch) {
-            (
-                epoch,
-                slot_count_per_epoch,
-                false,
-                0,
-                1,
-                slot_count_per_epoch,
-            )
+            // mnb should always go through this code path
+            Self::rent_single_epoch_collection_cycle_params(epoch, slot_count_per_epoch)
         } else {
             let epoch_count_in_cycle = self.slot_count_in_two_day() / slot_count_per_epoch;
             let partition_count = slot_count_per_epoch * epoch_count_in_cycle;
@@ -7484,6 +7533,26 @@ pub(crate) mod tests {
         assert_eq!(bank.collected_rent.load(Relaxed), rent_collected);
     }
 
+    fn test_rent_collection_partitions(bank: &Bank) -> Vec<Partition> {
+        let partitions = bank.rent_collection_partitions();
+        let slot = bank.slot();
+        if slot.saturating_sub(1) == bank.parent_slot() {
+            let partition = Bank::variable_cycle_partition_from_previous_slot(
+                bank.epoch_schedule(),
+                bank.slot(),
+            );
+            assert_eq!(
+                partitions.last().unwrap(),
+                &partition,
+                "slot: {}, slots per epoch: {}, partitions: {:?}",
+                bank.slot(),
+                bank.epoch_schedule().slots_per_epoch,
+                partitions
+            );
+        }
+        partitions
+    }
+
     #[test]
     fn test_rent_eager_across_epoch_without_gap() {
         let (genesis_config, _mint_keypair) = create_genesis_config(1);
@@ -7499,6 +7568,25 @@ pub(crate) mod tests {
         assert_eq!(bank.rent_collection_partitions(), vec![(30, 31, 32)]);
         bank = Arc::new(new_from_parent(&bank));
         assert_eq!(bank.rent_collection_partitions(), vec![(0, 0, 64)]);
+    }
+
+    #[test]
+    fn test_rent_eager_across_epoch_without_gap_mnb() {
+        solana_logger::setup();
+        let (mut genesis_config, _mint_keypair) = create_genesis_config(1);
+        genesis_config.cluster_type = ClusterType::MainnetBeta;
+
+        let mut bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        assert_eq!(test_rent_collection_partitions(&bank), vec![(0, 0, 32)]);
+
+        bank = Arc::new(new_from_parent(&bank));
+        assert_eq!(test_rent_collection_partitions(&bank), vec![(0, 1, 32)]);
+        for _ in 2..32 {
+            bank = Arc::new(new_from_parent(&bank));
+        }
+        assert_eq!(test_rent_collection_partitions(&bank), vec![(30, 31, 32)]);
+        bank = Arc::new(new_from_parent(&bank));
+        assert_eq!(test_rent_collection_partitions(&bank), vec![(0, 0, 64)]);
     }
 
     #[test]
@@ -8997,14 +9085,18 @@ pub(crate) mod tests {
         let bank = Bank::new_for_tests(&genesis_config);
 
         let key = Keypair::new();
-        let tx1 =
-            system_transaction::transfer(&mint_keypair, &key.pubkey(), 2, genesis_config.hash())
-                .try_into()
-                .unwrap();
-        let tx2 =
-            system_transaction::transfer(&mint_keypair, &key.pubkey(), 5, genesis_config.hash())
-                .try_into()
-                .unwrap();
+        let tx1 = SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            &mint_keypair,
+            &key.pubkey(),
+            2,
+            genesis_config.hash(),
+        ));
+        let tx2 = SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            &mint_keypair,
+            &key.pubkey(),
+            5,
+            genesis_config.hash(),
+        ));
 
         let results = vec![
             (Ok(()), None),
@@ -9144,7 +9236,7 @@ pub(crate) mod tests {
             system_transaction::transfer(&mint_keypair, &alice.pubkey(), 1, genesis_config.hash());
         let pay_alice = vec![tx1];
 
-        let lock_result = bank.prepare_batch(pay_alice).unwrap();
+        let lock_result = bank.prepare_batch_for_tests(pay_alice);
         let results_alice = bank
             .load_execute_and_commit_transactions(
                 &lock_result,
@@ -9197,7 +9289,7 @@ pub(crate) mod tests {
         let tx = Transaction::new(&[&key0], message, genesis_config.hash());
         let txs = vec![tx];
 
-        let batch0 = bank.prepare_batch(txs).unwrap();
+        let batch0 = bank.prepare_batch_for_tests(txs);
         assert!(batch0.lock_results()[0].is_ok());
 
         // Try locking accounts, locking a previously read-only account as writable
@@ -9215,7 +9307,7 @@ pub(crate) mod tests {
         let tx = Transaction::new(&[&key1], message, genesis_config.hash());
         let txs = vec![tx];
 
-        let batch1 = bank.prepare_batch(txs).unwrap();
+        let batch1 = bank.prepare_batch_for_tests(txs);
         assert!(batch1.lock_results()[0].is_err());
 
         // Try locking a previously read-only account a 2nd time; should succeed
@@ -9232,7 +9324,7 @@ pub(crate) mod tests {
         let tx = Transaction::new(&[&key2], message, genesis_config.hash());
         let txs = vec![tx];
 
-        let batch2 = bank.prepare_batch(txs).unwrap();
+        let batch2 = bank.prepare_batch_for_tests(txs);
         assert!(batch2.lock_results()[0].is_ok());
     }
 
@@ -10764,7 +10856,7 @@ pub(crate) mod tests {
         );
         let nonce_account = bank.get_account(&nonce_pubkey).unwrap();
         assert_eq!(
-            bank.check_tx_durable_nonce(&tx.try_into().unwrap()),
+            bank.check_tx_durable_nonce(&SanitizedTransaction::from_transaction_for_tests(tx)),
             Some((nonce_pubkey, nonce_account))
         );
     }
@@ -10787,7 +10879,7 @@ pub(crate) mod tests {
             nonce_hash,
         );
         assert!(bank
-            .check_tx_durable_nonce(&tx.try_into().unwrap())
+            .check_tx_durable_nonce(&SanitizedTransaction::from_transaction_for_tests(tx,))
             .is_none());
     }
 
@@ -10810,7 +10902,7 @@ pub(crate) mod tests {
         );
         tx.message.instructions[0].accounts.clear();
         assert!(bank
-            .check_tx_durable_nonce(&tx.try_into().unwrap())
+            .check_tx_durable_nonce(&SanitizedTransaction::from_transaction_for_tests(tx))
             .is_none());
     }
 
@@ -10834,7 +10926,7 @@ pub(crate) mod tests {
             nonce_hash,
         );
         assert!(bank
-            .check_tx_durable_nonce(&tx.try_into().unwrap())
+            .check_tx_durable_nonce(&SanitizedTransaction::from_transaction_for_tests(tx))
             .is_none());
     }
 
@@ -10855,7 +10947,7 @@ pub(crate) mod tests {
             Hash::default(),
         );
         assert!(bank
-            .check_tx_durable_nonce(&tx.try_into().unwrap())
+            .check_tx_durable_nonce(&SanitizedTransaction::from_transaction_for_tests(tx))
             .is_none());
     }
 
@@ -10933,8 +11025,12 @@ pub(crate) mod tests {
         assert_eq!(bank.process_transaction(&durable_tx), Ok(()));
 
         /* Check balances */
-        let mut expected_balance =
-            4_650_000 - bank.get_fee_for_message(&durable_tx.message.try_into().unwrap());
+        let mut recent_message = durable_tx.message;
+        recent_message.recent_blockhash = bank.last_blockhash();
+        let mut expected_balance = 4_650_000
+            - bank
+                .get_fee_for_message(&recent_message.try_into().unwrap())
+                .unwrap();
         assert_eq!(bank.get_balance(&custodian_pubkey), expected_balance);
         assert_eq!(bank.get_balance(&nonce_pubkey), 250_000);
         assert_eq!(bank.get_balance(&alice_pubkey), 100_000);
@@ -10986,8 +11082,11 @@ pub(crate) mod tests {
             ))
         );
         /* Check fee charged and nonce has advanced */
+        let mut recent_message = durable_tx.message.clone();
+        recent_message.recent_blockhash = bank.last_blockhash();
         expected_balance -= bank
-            .get_fee_for_message(&SanitizedMessage::try_from(durable_tx.message.clone()).unwrap());
+            .get_fee_for_message(&SanitizedMessage::try_from(recent_message).unwrap())
+            .unwrap();
         assert_eq!(bank.get_balance(&custodian_pubkey), expected_balance);
         assert_ne!(nonce_hash, get_nonce_account(&bank, &nonce_pubkey).unwrap());
         /* Confirm replaying a TX that failed with InstructionError::* now
@@ -11046,10 +11145,14 @@ pub(crate) mod tests {
             ))
         );
         /* Check fee charged and nonce has *not* advanced */
+        let mut recent_message = durable_tx.message;
+        recent_message.recent_blockhash = bank.last_blockhash();
         assert_eq!(
             bank.get_balance(&custodian_pubkey),
             initial_custodian_balance
-                - bank.get_fee_for_message(&durable_tx.message.try_into().unwrap())
+                - bank
+                    .get_fee_for_message(&recent_message.try_into().unwrap())
+                    .unwrap()
         );
         assert_eq!(nonce_hash, get_nonce_account(&bank, &nonce_pubkey).unwrap());
     }
@@ -11096,10 +11199,14 @@ pub(crate) mod tests {
             ))
         );
         /* Check fee charged and nonce has advanced */
+        let mut recent_message = durable_tx.message;
+        recent_message.recent_blockhash = bank.last_blockhash();
         assert_eq!(
             bank.get_balance(&nonce_pubkey),
             nonce_starting_balance
-                - bank.get_fee_for_message(&durable_tx.message.try_into().unwrap())
+                - bank
+                    .get_fee_for_message(&recent_message.try_into().unwrap())
+                    .unwrap()
         );
         assert_ne!(nonce_hash, get_nonce_account(&bank, &nonce_pubkey).unwrap());
     }
@@ -11206,14 +11313,14 @@ pub(crate) mod tests {
             instructions,
         );
         let txs = vec![tx0, tx1];
-        let batch = bank0.prepare_batch(txs.clone()).unwrap();
+        let batch = bank0.prepare_batch_for_tests(txs.clone());
         let balances = bank0.collect_balances(&batch);
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0], vec![8, 11, 1]);
         assert_eq!(balances[1], vec![8, 0, 1]);
 
         let txs: Vec<_> = txs.into_iter().rev().collect();
-        let batch = bank0.prepare_batch(txs).unwrap();
+        let batch = bank0.prepare_batch_for_tests(txs);
         let balances = bank0.collect_balances(&batch);
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0], vec![8, 0, 1]);
@@ -11247,7 +11354,7 @@ pub(crate) mod tests {
         let tx2 = system_transaction::transfer(&keypair1, &pubkey2, 12, blockhash);
         let txs = vec![tx0, tx1, tx2];
 
-        let lock_result = bank0.prepare_batch(txs).unwrap();
+        let lock_result = bank0.prepare_batch_for_tests(txs);
         let (transaction_results, transaction_balances_set, inner_instructions, transaction_logs) =
             bank0.load_execute_and_commit_transactions(
                 &lock_result,
@@ -14424,7 +14531,7 @@ pub(crate) mod tests {
         let failure_sig = tx1.signatures[0];
         let tx2 = system_transaction::transfer(&sender0, &recipient0, 1, blockhash);
         let txs = vec![tx0, tx1, tx2];
-        let batch = bank.prepare_batch(txs).unwrap();
+        let batch = bank.prepare_batch_for_tests(txs);
 
         let log_results = bank
             .load_execute_and_commit_transactions(
@@ -14777,6 +14884,60 @@ pub(crate) mod tests {
         assert_eq!(rent_debits.0.len(), 1);
         rent_debits.push(&Pubkey::default(), i64::MAX as u64, 0);
         assert_eq!(rent_debits.0.len(), 2);
+    }
+
+    #[test]
+    fn test_compute_budget_program_noop() {
+        solana_logger::setup();
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(
+            1_000_000_000_000_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+
+        // activate all features except..
+        activate_all_features(&mut genesis_config);
+        genesis_config
+            .accounts
+            .remove(&feature_set::tx_wide_compute_cap::id());
+        genesis_config
+            .accounts
+            .remove(&feature_set::requestable_heap_size::id());
+        let mut bank = Bank::new_for_tests(&genesis_config);
+
+        fn mock_ix_processor(
+            _first_instruction_account: usize,
+            _data: &[u8],
+            invoke_context: &mut dyn InvokeContext,
+        ) -> std::result::Result<(), InstructionError> {
+            let compute_budget = invoke_context.get_compute_budget();
+            assert_eq!(
+                *compute_budget,
+                ComputeBudget {
+                    max_units: 200_000,
+                    heap_size: None,
+                    ..ComputeBudget::default()
+                }
+            );
+            Ok(())
+        }
+        let program_id = solana_sdk::pubkey::new_rand();
+        bank.add_builtin("mock_program", &program_id, mock_ix_processor);
+
+        let message = Message::new(
+            &[
+                ComputeBudgetInstruction::request_units(1),
+                ComputeBudgetInstruction::request_heap_frame(48 * 1024),
+                Instruction::new_with_bincode(program_id, &0, vec![]),
+            ],
+            Some(&mint_keypair.pubkey()),
+        );
+        let tx = Transaction::new(&[&mint_keypair], message, bank.last_blockhash());
+        bank.process_transaction(&tx).unwrap();
     }
 
     #[test]

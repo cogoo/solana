@@ -1150,13 +1150,15 @@ mod with_incremental_snapshots {
         cluster_info: &ClusterInfo,
         validator_config: &ValidatorConfig,
     ) -> HashMap<(Slot, Hash), HashSet<(Slot, Hash)>> {
+        if validator_config.trusted_validators.is_none() {
+            trace!("no trusted validators, so no trusted snapshot hashes");
+            return HashMap::new();
+        }
+        let trusted_validators = validator_config.trusted_validators.as_ref().unwrap();
+
         let mut trusted_snapshot_hashes: HashMap<(Slot, Hash), HashSet<(Slot, Hash)>> =
             HashMap::new();
-        validator_config
-        .trusted_validators
-        .iter()
-        .for_each(|trusted_validators| {
-            trusted_validators
+        trusted_validators
             .iter()
             .for_each(|trusted_validator| {
                 if let Some(crds_value::IncrementalSnapshotHashes {base: full_snapshot_hash, hashes: incremental_snapshot_hashes, ..}) = cluster_info.get_incremental_snapshot_hashes_for_node(trusted_validator) {
@@ -1197,8 +1199,7 @@ mod with_incremental_snapshots {
                         }
                     }
                 }
-            })
-        });
+            });
 
         trace!("trusted snapshot hashes: {:?}", &trusted_snapshot_hashes);
         trusted_snapshot_hashes
@@ -1275,7 +1276,9 @@ mod with_incremental_snapshots {
                 .get(&peer_snapshot_hash.snapshot_hash.full)
                 .map(|trusted_incremental_hashes| {
                     if peer_snapshot_hash.snapshot_hash.incr.is_none() {
-                        false
+                        // If the peer's full snapshot hashes match, but doesn't have any
+                        // incremental snapshots, that's fine; keep 'em!
+                        true
                     } else {
                         trusted_incremental_hashes
                             .contains(peer_snapshot_hash.snapshot_hash.incr.as_ref().unwrap())
@@ -1699,11 +1702,14 @@ mod with_incremental_snapshots {
                 ),
             ];
 
-            let expected = vec![PeerSnapshotHash::new(
-                contact_info,
-                *trusted_full_snapshot_hash,
-                Some(*trusted_incremental_snapshot_hash),
-            )];
+            let expected = vec![
+                PeerSnapshotHash::new(contact_info.clone(), *trusted_full_snapshot_hash, None),
+                PeerSnapshotHash::new(
+                    contact_info,
+                    *trusted_full_snapshot_hash,
+                    Some(*trusted_incremental_snapshot_hash),
+                ),
+            ];
             let mut actual = peer_snapshot_hashes;
             retain_trusted_peer_snapshot_hashes(&trusted_snapshot_hashes, &mut actual);
             assert_eq!(expected, actual);

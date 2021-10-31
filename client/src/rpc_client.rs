@@ -21,9 +21,9 @@ use {
         rpc_request::{RpcError, RpcRequest, RpcResponseErrorData, TokenAccountsFilter},
         rpc_response::*,
         rpc_sender::*,
+        spinner,
     },
     bincode::serialize,
-    indicatif::{ProgressBar, ProgressStyle},
     log::*,
     serde_json::{json, Value},
     solana_account_decoder::{
@@ -1062,7 +1062,7 @@ impl RpcClient {
         };
         let mut confirmations = 0;
 
-        let progress_bar = new_spinner_progress_bar();
+        let progress_bar = spinner::new_progress_bar();
 
         progress_bar.set_message(format!(
             "[{}/{}] Finalizing transaction {}",
@@ -4285,7 +4285,7 @@ impl RpcClient {
 
     #[deprecated(
         since = "1.9.0",
-        note = "Please use `get_new_latest_blockhash` instead"
+        note = "Please do not use, will no longer be available in the future"
     )]
     #[allow(deprecated)]
     pub fn get_new_blockhash(&self, blockhash: &Hash) -> ClientResult<(Hash, FeeCalculator)> {
@@ -4802,7 +4802,9 @@ impl RpcClient {
     #[allow(deprecated)]
     pub fn get_fee_for_message(&self, message: &Message) -> ClientResult<u64> {
         if self.get_node_version()? < semver::Version::new(1, 9, 0) {
-            let Fees { fee_calculator, .. } = self.get_fees()?;
+            let fee_calculator = self
+                .get_fee_calculator_for_blockhash(&message.recent_blockhash)?
+                .ok_or_else(|| ClientErrorKind::Custom("Invalid blockhash".to_string()))?;
             Ok(fee_calculator
                 .lamports_per_signature
                 .saturating_mul(message.header.num_required_signatures as u64))
@@ -4874,14 +4876,6 @@ pub struct GetConfirmedSignaturesForAddress2Config {
     pub until: Option<Signature>,
     pub limit: Option<usize>,
     pub commitment: Option<CommitmentConfig>,
-}
-
-fn new_spinner_progress_bar() -> ProgressBar {
-    let progress_bar = ProgressBar::new(42);
-    progress_bar
-        .set_style(ProgressStyle::default_spinner().template("{spinner:.green} {wide_msg}"));
-    progress_bar.enable_steady_tick(100);
-    progress_bar
 }
 
 fn get_rpc_request_str(rpc_addr: SocketAddr, tls: bool) -> String {

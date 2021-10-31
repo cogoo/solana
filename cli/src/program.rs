@@ -12,9 +12,9 @@ use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
 use solana_bpf_loader_program::{syscalls::register_syscalls, BpfError, ThisInstructionMeter};
 use solana_clap_utils::{self, input_parsers::*, input_validators::*, keypair::*};
 use solana_cli_output::{
-    display::new_spinner_progress_bar, CliProgram, CliProgramAccountType, CliProgramAuthority,
-    CliProgramBuffer, CliProgramId, CliUpgradeableBuffer, CliUpgradeableBuffers,
-    CliUpgradeableProgram, CliUpgradeableProgramClosed, CliUpgradeablePrograms,
+    CliProgram, CliProgramAccountType, CliProgramAuthority, CliProgramBuffer, CliProgramId,
+    CliUpgradeableBuffer, CliUpgradeableBuffers, CliUpgradeableProgram,
+    CliUpgradeableProgramClosed, CliUpgradeablePrograms,
 };
 use solana_client::{
     client_error::ClientErrorKind,
@@ -22,7 +22,6 @@ use solana_client::{
     rpc_config::RpcSendTransactionConfig,
     rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
     rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
-    rpc_request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
     tpu_client::{TpuClient, TpuClientConfig},
 };
 use solana_rbpf::{
@@ -44,24 +43,18 @@ use solana_sdk::{
     process_instruction::MockInvokeContext,
     pubkey::Pubkey,
     signature::{keypair_from_seed, read_keypair_file, Keypair, Signature, Signer},
-    signers::Signers,
     system_instruction::{self, SystemError},
     system_program,
     transaction::Transaction,
     transaction::TransactionError,
 };
-use solana_transaction_status::TransactionConfirmationStatus;
 use std::{
-    collections::HashMap,
-    error,
     fs::File,
     io::{Read, Write},
     mem::size_of,
     path::PathBuf,
     str::FromStr,
     sync::Arc,
-    thread::sleep,
-    time::Duration,
 };
 
 #[derive(Debug, PartialEq)]
@@ -1717,6 +1710,7 @@ fn do_process_program_write_and_deploy(
 ) -> ProcessResult {
     // Build messages to calculate fees
     let mut messages: Vec<&Message> = Vec::new();
+    let blockhash = rpc_client.get_latest_blockhash()?;
 
     // Initialize buffer account or complete if already partially initialized
     let (initial_message, write_messages, balance_needed) =
@@ -1762,9 +1756,10 @@ fn do_process_program_write_and_deploy(
                 )
             };
             let initial_message = if !initial_instructions.is_empty() {
-                Some(Message::new(
+                Some(Message::new_with_blockhash(
                     &initial_instructions,
                     Some(&config.signers[0].pubkey()),
+                    &blockhash,
                 ))
             } else {
                 None
@@ -1784,7 +1779,7 @@ fn do_process_program_write_and_deploy(
                 } else {
                     loader_instruction::write(buffer_pubkey, loader_id, offset, bytes)
                 };
-                Message::new(&[instruction], Some(&payer_pubkey))
+                Message::new_with_blockhash(&[instruction], Some(&payer_pubkey), &blockhash)
             };
 
             let mut write_messages = vec![];
@@ -1813,7 +1808,7 @@ fn do_process_program_write_and_deploy(
 
     let final_message = if let Some(program_signers) = program_signers {
         let message = if loader_id == &bpf_loader_upgradeable::id() {
-            Message::new(
+            Message::new_with_blockhash(
                 &bpf_loader_upgradeable::deploy_with_max_program_len(
                     &config.signers[0].pubkey(),
                     &program_signers[0].pubkey(),
@@ -1825,11 +1820,13 @@ fn do_process_program_write_and_deploy(
                     programdata_len,
                 )?,
                 Some(&config.signers[0].pubkey()),
+                &blockhash,
             )
         } else {
-            Message::new(
+            Message::new_with_blockhash(
                 &[loader_instruction::finalize(buffer_pubkey, loader_id)],
                 Some(&config.signers[0].pubkey()),
+                &blockhash,
             )
         };
         Some(message)
@@ -1883,6 +1880,7 @@ fn do_process_program_upgrade(
 
     // Build messages to calculate fees
     let mut messages: Vec<&Message> = Vec::new();
+    let blockhash = rpc_client.get_latest_blockhash()?;
 
     let (initial_message, write_messages, balance_needed) =
         if let Some(buffer_signer) = buffer_signer {
@@ -1914,9 +1912,10 @@ fn do_process_program_upgrade(
             };
 
             let initial_message = if !initial_instructions.is_empty() {
-                Some(Message::new(
+                Some(Message::new_with_blockhash(
                     &initial_instructions,
                     Some(&config.signers[0].pubkey()),
+                    &blockhash,
                 ))
             } else {
                 None
@@ -1932,7 +1931,7 @@ fn do_process_program_upgrade(
                     offset,
                     bytes,
                 );
-                Message::new(&[instruction], Some(&payer_pubkey))
+                Message::new_with_blockhash(&[instruction], Some(&payer_pubkey), &blockhash)
             };
 
             // Create and add write messages
@@ -1959,7 +1958,7 @@ fn do_process_program_upgrade(
     }
 
     // Create and add final message
-    let final_message = Message::new(
+    let final_message = Message::new_with_blockhash(
         &[bpf_loader_upgradeable::upgrade(
             program_id,
             buffer_pubkey,
@@ -1967,6 +1966,7 @@ fn do_process_program_upgrade(
             &config.signers[0].pubkey(),
         )],
         Some(&config.signers[0].pubkey()),
+        &blockhash,
     );
     messages.push(&final_message);
 
@@ -2121,16 +2121,20 @@ fn send_deploy_messages(
     if let Some(write_messages) = write_messages {
         if let Some(write_signer) = write_signer {
             trace!("Writing program data");
-            let transaction_errors = send_and_confirm_messages_with_spinner(
+            let tpu_client = TpuClient::new(
                 rpc_client.clone(),
                 &config.websocket_url,
-                write_messages,
-                &[payer_signer, write_signer],
-            )
-            .map_err(|err| format!("Data writes to account failed: {}", err))?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+                TpuClientConfig::default(),
+            )?;
+            let transaction_errors = tpu_client
+                .send_and_confirm_messages_with_spinner(
+                    write_messages,
+                    &[payer_signer, write_signer],
+                )
+                .map_err(|err| format!("Data writes to account failed: {}", err))?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
 
             if !transaction_errors.is_empty() {
                 for transaction_error in &transaction_errors {
@@ -2198,146 +2202,6 @@ fn report_ephemeral_mnemonic(words: usize, mnemonic: bip39::Mnemonic) {
         "[BUFFER_ACCOUNT_ADDRESS] argument to `solana program close`.\n{}",
         divider
     );
-}
-
-fn send_and_confirm_messages_with_spinner<T: Signers>(
-    rpc_client: Arc<RpcClient>,
-    websocket_url: &str,
-    messages: &[Message],
-    signers: &T,
-) -> Result<Vec<Option<TransactionError>>, Box<dyn error::Error>> {
-    let commitment = rpc_client.commitment();
-
-    let progress_bar = new_spinner_progress_bar();
-    let send_transaction_interval = Duration::from_millis(10); /* ~100 TPS */
-    let mut send_retries = 5;
-
-    let (blockhash, mut last_valid_block_height) =
-        rpc_client.get_latest_blockhash_with_commitment(commitment)?;
-
-    let mut transactions = vec![];
-    let mut transaction_errors = vec![None; messages.len()];
-    for (i, message) in messages.iter().enumerate() {
-        let mut transaction = Transaction::new_unsigned(message.clone());
-        transaction.try_sign(signers, blockhash)?;
-        transactions.push((i, transaction));
-    }
-
-    progress_bar.set_message("Finding leader nodes...");
-    let tpu_client = TpuClient::new(
-        rpc_client.clone(),
-        websocket_url,
-        TpuClientConfig::default(),
-    )?;
-    loop {
-        // Send all transactions
-        let mut pending_transactions = HashMap::new();
-        let num_transactions = transactions.len();
-        for (i, transaction) in transactions {
-            if !tpu_client.send_transaction(&transaction) {
-                let _result = rpc_client
-                    .send_transaction_with_config(
-                        &transaction,
-                        RpcSendTransactionConfig {
-                            preflight_commitment: Some(commitment.commitment),
-                            ..RpcSendTransactionConfig::default()
-                        },
-                    )
-                    .ok();
-            }
-            pending_transactions.insert(transaction.signatures[0], (i, transaction));
-            progress_bar.set_message(format!(
-                "[{}/{}] Transactions sent",
-                pending_transactions.len(),
-                num_transactions
-            ));
-
-            sleep(send_transaction_interval);
-        }
-
-        // Collect statuses for all the transactions, drop those that are confirmed
-        loop {
-            let mut block_height = 0;
-            let pending_signatures = pending_transactions.keys().cloned().collect::<Vec<_>>();
-            for pending_signatures_chunk in
-                pending_signatures.chunks(MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS)
-            {
-                if let Ok(result) = rpc_client.get_signature_statuses(pending_signatures_chunk) {
-                    let statuses = result.value;
-                    for (signature, status) in
-                        pending_signatures_chunk.iter().zip(statuses.into_iter())
-                    {
-                        if let Some(status) = status {
-                            if let Some(confirmation_status) = &status.confirmation_status {
-                                if *confirmation_status != TransactionConfirmationStatus::Processed
-                                {
-                                    if let Some((i, _)) = pending_transactions.remove(signature) {
-                                        transaction_errors[i] = status.err;
-                                    }
-                                }
-                            } else if status.confirmations.is_none()
-                                || status.confirmations.unwrap() > 1
-                            {
-                                if let Some((i, _)) = pending_transactions.remove(signature) {
-                                    transaction_errors[i] = status.err;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                block_height = rpc_client.get_block_height()?;
-                progress_bar.set_message(format!(
-                    "[{}/{}] Transactions confirmed. Retrying in {} blocks",
-                    num_transactions - pending_transactions.len(),
-                    num_transactions,
-                    last_valid_block_height.saturating_sub(block_height)
-                ));
-            }
-
-            if pending_transactions.is_empty() {
-                return Ok(transaction_errors);
-            }
-
-            if block_height > last_valid_block_height {
-                break;
-            }
-
-            for (_i, transaction) in pending_transactions.values() {
-                if !tpu_client.send_transaction(transaction) {
-                    let _result = rpc_client
-                        .send_transaction_with_config(
-                            transaction,
-                            RpcSendTransactionConfig {
-                                preflight_commitment: Some(commitment.commitment),
-                                ..RpcSendTransactionConfig::default()
-                            },
-                        )
-                        .ok();
-                }
-            }
-
-            if cfg!(not(test)) {
-                // Retry twice a second
-                sleep(Duration::from_millis(500));
-            }
-        }
-
-        if send_retries == 0 {
-            return Err("Transactions failed".into());
-        }
-        send_retries -= 1;
-
-        // Re-sign any failed transactions with a new blockhash and retry
-        let (blockhash, new_last_valid_block_height) =
-            rpc_client.get_latest_blockhash_with_commitment(commitment)?;
-        last_valid_block_height = new_last_valid_block_height;
-        transactions = vec![];
-        for (_, (i, mut transaction)) in pending_transactions.into_iter() {
-            transaction.try_sign(signers, blockhash)?;
-            transactions.push((i, transaction));
-        }
-    }
 }
 
 #[cfg(test)]

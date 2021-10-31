@@ -53,6 +53,7 @@ use solana_rayon_threadlimit::get_thread_count;
 use solana_sdk::{
     account::{AccountSharedData, ReadableAccount},
     clock::{BankId, Epoch, Slot, SlotCount},
+    epoch_schedule::EpochSchedule,
     genesis_config::ClusterType,
     hash::{Hash, Hasher},
     pubkey::Pubkey,
@@ -5827,25 +5828,16 @@ impl AccountsDb {
                     if self.is_filler_account(loaded_account.pubkey()) {
                         return;
                     }
-                    let should_insert =
-                        if let Some(existing_entry) = accum.get(loaded_account.pubkey()) {
-                            loaded_write_version > existing_entry.value().version()
-                        } else {
-                            true
-                        };
-                    if should_insert {
-                        // Detected insertion is necessary, grabs the write lock to commit the write,
-                        match accum.entry(*loaded_account.pubkey()) {
-                            // Double check in case another thread interleaved a write between the read + write.
-                            Occupied(mut occupied_entry) => {
-                                if loaded_write_version > occupied_entry.get().version() {
-                                    occupied_entry.insert((loaded_write_version, loaded_hash));
-                                }
+                    // keep the latest write version for each pubkey
+                    match accum.entry(*loaded_account.pubkey()) {
+                        Occupied(mut occupied_entry) => {
+                            if loaded_write_version > occupied_entry.get().version() {
+                                occupied_entry.insert((loaded_write_version, loaded_hash));
                             }
+                        }
 
-                            Vacant(vacant_entry) => {
-                                vacant_entry.insert((loaded_write_version, loaded_hash));
-                            }
+                        Vacant(vacant_entry) => {
+                            vacant_entry.insert((loaded_write_version, loaded_hash));
                         }
                     }
                 },
@@ -6760,13 +6752,21 @@ impl AccountsDb {
         Self::is_filler_account_helper(pubkey, self.filler_account_suffix.as_ref())
     }
 
+    /// retain slots in 'roots' that are > (max(roots) - slots_per_epoch)
+    fn retain_roots_within_one_epoch_range(roots: &mut Vec<Slot>, slots_per_epoch: SlotCount) {
+        if let Some(max) = roots.iter().max() {
+            let min = max - slots_per_epoch;
+            roots.retain(|slot| slot > &min);
+        }
+    }
+
     /// filler accounts are space-holding accounts which are ignored by hash calculations and rent.
     /// They are designed to allow a validator to run against a network successfully while simulating having many more accounts present.
     /// All filler accounts share a common pubkey suffix. The suffix is randomly generated per validator on startup.
     /// The filler accounts are added to each slot in the snapshot after index generation.
     /// The accounts added in a slot are setup to have pubkeys such that rent will be collected from them before (or when?) their slot becomes an epoch old.
     /// Thus, the filler accounts are rewritten by rent and the old slot can be thrown away successfully.
-    pub fn maybe_add_filler_accounts(&self, ticks_per_slot: SlotCount) {
+    pub fn maybe_add_filler_accounts(&self, epoch_schedule: &EpochSchedule) {
         if self.filler_account_count == 0 {
             return;
         }
@@ -6774,7 +6774,8 @@ impl AccountsDb {
         info!("adding {} filler accounts", self.filler_account_count);
         // break this up to force the accounts out of memory after each pass
         let passes = 100;
-        let roots = self.storage.all_slots();
+        let mut roots = self.storage.all_slots();
+        Self::retain_roots_within_one_epoch_range(&mut roots, epoch_schedule.slots_per_epoch);
         let root_count = roots.len();
         let per_pass = std::cmp::max(1, root_count / passes);
         let overall_index = AtomicUsize::new(0);
@@ -6792,8 +6793,6 @@ impl AccountsDb {
                 .skip(pass * per_pass)
                 .take(per_pass)
                 .collect::<Vec<_>>();
-            let slot_count_in_two_day =
-                crate::bank::Bank::slot_count_in_two_day_helper(ticks_per_slot);
             self.thread_pool.install(|| {
                 roots_in_this_pass.into_par_iter().for_each(|slot| {
                     let storage_maps: Vec<Arc<AccountStorageEntry>> = self
@@ -6804,13 +6803,10 @@ impl AccountsDb {
                         return;
                     }
 
-                    let partition = *crate::bank::Bank::get_partitions(
+                    let partition = crate::bank::Bank::variable_cycle_partition_from_previous_slot(
+                        epoch_schedule,
                         *slot,
-                        slot.saturating_sub(1),
-                        slot_count_in_two_day,
-                    )
-                    .last()
-                    .unwrap();
+                    );
                     let subrange = crate::bank::Bank::pubkey_range_from_partition(partition);
 
                     let idx = overall_index.fetch_add(1, Ordering::Relaxed);
@@ -7376,6 +7372,14 @@ pub mod tests {
                 None,
             )
         }
+    }
+
+    #[test]
+    fn test_retain_roots_within_one_epoch_range() {
+        let mut roots = vec![0, 1, 2];
+        let slots_per_epoch = 2;
+        AccountsDb::retain_roots_within_one_epoch_range(&mut roots, slots_per_epoch);
+        assert_eq!(&vec![1, 2], &roots);
     }
 
     #[test]
