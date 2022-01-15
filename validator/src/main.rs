@@ -1,4 +1,6 @@
 #![allow(clippy::integer_arithmetic)]
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
 use {
     clap::{
         crate_description, crate_name, value_t, value_t_or_exit, values_t, values_t_or_exit, App,
@@ -10,8 +12,8 @@ use {
     solana_clap_utils::{
         input_parsers::{keypair_of, keypairs_of, pubkey_of, value_of},
         input_validators::{
-            is_keypair, is_keypair_or_ask_keyword, is_parsable, is_pow2, is_pubkey,
-            is_pubkey_or_keypair, is_slot, is_valid_percentage,
+            is_keypair, is_keypair_or_ask_keyword, is_niceness_adjustment_valid, is_parsable,
+            is_pow2, is_pubkey, is_pubkey_or_keypair, is_slot, is_valid_percentage,
         },
         keypair::SKIP_SEED_PHRASE_VALIDATION_ARG,
     },
@@ -78,9 +80,6 @@ use {
         time::{Duration, SystemTime},
     },
 };
-
-#[cfg(not(target_env = "msvc"))]
-use jemallocator::Jemalloc;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -423,9 +422,7 @@ fn platform_id() -> String {
 
 #[cfg(target_os = "linux")]
 fn check_os_network_limits() {
-    use solana_metrics::datapoint_warn;
-    use std::collections::HashMap;
-    use sysctl::Sysctl;
+    use {solana_metrics::datapoint_warn, std::collections::HashMap, sysctl::Sysctl};
 
     fn sysctl_read(name: &str) -> Result<String, sysctl::SysctlError> {
         let ctl = sysctl::Ctl::new(name)?;
@@ -607,13 +604,6 @@ pub fn main() {
                 .takes_value(false)
                 .help("Do not attempt to fetch a snapshot from the cluster, \
                       start from a local snapshot if present"),
-        )
-        .arg(
-            Arg::with_name("no_incremental_snapshot_fetch")
-                .long("no-incremental-snapshot-fetch")
-                .takes_value(false)
-                .help("Do not attempt to fetch incremental snapshots from the cluster, only fetch \
-                      full snapshots"),
         )
         .arg(
             Arg::with_name("no_genesis_fetch")
@@ -918,6 +908,16 @@ pub fn main() {
                 .help("The maximum number of incremental snapshot archives to hold on to when purging older snapshots.")
         )
         .arg(
+            Arg::with_name("snapshot_packager_niceness_adj")
+                .long("snapshot-packager-niceness-adjustment")
+                .value_name("ADJUSTMENT")
+                .takes_value(true)
+                .validator(is_niceness_adjustment_valid)
+                .default_value("0")
+                .help("Add this value to niceness of snapshot packager thread. Negative value \
+                      increases priority, positive value decreases priority.")
+        )
+        .arg(
             Arg::with_name("minimal_snapshot_download_speed")
                 .long("minimal-snapshot-download-speed")
                 .value_name("MINIMAL_SNAPSHOT_DOWNLOAD_SPEED")
@@ -954,6 +954,11 @@ pub fn main() {
                 .hidden(true)
                 .long("no-os-network-limits-test")
                 .help("Skip checks for OS network limits.")
+        )
+        .arg(
+            Arg::with_name("no_os_network_stats_reporting")
+                .long("no-os-network-stats-reporting")
+                .help("Disable reporting of OS network statistics.")
         )
         .arg(
             Arg::with_name("accounts-hash-interval-slots")
@@ -1069,7 +1074,7 @@ pub fn main() {
                 .help("Add a hard fork at this slot"),
         )
         .arg(
-            Arg::with_name("trusted_validators")
+            Arg::with_name("known_validators")
                 .alias("trusted-validator")
                 .long("known-validator")
                 .validator(is_pubkey)
@@ -1089,7 +1094,7 @@ pub fn main() {
                 .help("Log when transactions are processed which reference a given key."),
         )
         .arg(
-            Arg::with_name("no_untrusted_rpc")
+            Arg::with_name("only_known_rpc")
                 .alias("no-untrusted-rpc")
                 .long("only-known-rpc")
                 .takes_value(false)
@@ -1171,6 +1176,16 @@ pub fn main() {
                 .help("Number of threads to use for servicing RPC requests"),
         )
         .arg(
+            Arg::with_name("rpc_niceness_adj")
+                .long("rpc-niceness-adjustment")
+                .value_name("ADJUSTMENT")
+                .takes_value(true)
+                .validator(is_niceness_adjustment_valid)
+                .default_value("0")
+                .help("Add this value to niceness of RPC threads. Negative value \
+                      increases priority, positive value decreases priority.")
+        )
+        .arg(
             Arg::with_name("rpc_bigtable_timeout")
                 .long("rpc-bigtable-timeout")
                 .value_name("SECONDS")
@@ -1178,6 +1193,22 @@ pub fn main() {
                 .takes_value(true)
                 .default_value("30")
                 .help("Number of seconds before timing out RPC requests backed by BigTable"),
+        )
+        .arg(
+            Arg::with_name("rpc_pubsub_worker_threads")
+                .long("rpc-pubsub-worker-threads")
+                .takes_value(true)
+                .value_name("NUMBER")
+                .validator(is_parsable::<usize>)
+                .default_value("4")
+                .help("PubSub worker threads"),
+        )
+        .arg(
+            Arg::with_name("rpc_pubsub_enable_block_subscription")
+                .long("rpc-pubsub-enable-block-subscription")
+                .requires("enable_rpc_transaction_history")
+                .takes_value(false)
+                .help("Enable the unstable RPC PubSub `blockSubscribe` subscription"),
         )
         .arg(
             Arg::with_name("rpc_pubsub_enable_vote_subscription")
@@ -1255,6 +1286,15 @@ pub fn main() {
                 .default_value(&default_rpc_pubsub_queue_capacity_bytes)
                 .help("The maximum total size of notifications that RPC PubSub will store \
                        across all connections."),
+        )
+        .arg(
+            Arg::with_name("rpc_pubsub_notification_threads")
+                .long("rpc-pubsub-notification-threads")
+                .takes_value(true)
+                .value_name("NUM_THREADS")
+                .validator(is_parsable::<usize>)
+                .help("The maximum number of threads that RPC PubSub will use \
+                       for generating notifications."),
         )
         .arg(
             Arg::with_name("rpc_send_transaction_retry_ms")
@@ -1343,23 +1383,12 @@ pub fn main() {
                 .help("Specify the configuration file for the AccountsDb plugin."),
         )
         .arg(
-            Arg::with_name("halt_on_trusted_validators_accounts_hash_mismatch")
+            Arg::with_name("halt_on_known_validators_accounts_hash_mismatch")
                 .alias("halt-on-trusted-validators-accounts-hash-mismatch")
                 .long("halt-on-known-validators-accounts-hash-mismatch")
-                .requires("trusted_validators")
+                .requires("known_validators")
                 .takes_value(false)
                 .help("Abort the validator if a bank hash mismatch is detected within known validator set"),
-        )
-        .arg(
-            Arg::with_name("frozen_accounts")
-                .long("frozen-account")
-                .validator(is_pubkey)
-                .value_name("PUBKEY")
-                .multiple(true)
-                .takes_value(true)
-                .help("Freeze the specified account.  This will cause the validator to \
-                       intentionally crash should any transaction modify the frozen account in any way \
-                       other than increasing the account balance"),
         )
         .arg(
             Arg::with_name("snapshot_archive_format")
@@ -1473,6 +1502,22 @@ pub fn main() {
                       This option is for use during testing."),
         )
         .arg(
+            Arg::with_name("accounts_db_cache_limit_mb")
+                .long("accounts-db-cache-limit-mb")
+                .value_name("MEGABYTES")
+                .validator(is_parsable::<u64>)
+                .takes_value(true)
+                .help("How large the write cache for account data can become. If this is exceeded, the cache is flushed more aggressively."),
+        )
+        .arg(
+            Arg::with_name("accounts_index_scan_results_limit_mb")
+                .long("accounts-index-scan-results-limit-mb")
+                .value_name("MEGABYTES")
+                .validator(is_parsable::<usize>)
+                .takes_value(true)
+                .help("How large accumulated results from an accounts index scan can become. If this is exceeded, the scan aborts."),
+        )
+        .arg(
             Arg::with_name("accounts_index_memory_limit_mb")
                 .long("accounts-index-memory-limit-mb")
                 .value_name("MEGABYTES")
@@ -1575,14 +1620,6 @@ pub fn main() {
                 .help("Allow contacting private ip addresses")
                 .hidden(true),
         )
-        .arg(
-            Arg::with_name("disable_epoch_boundary_optimization")
-                .long("disable-epoch-boundary-optimization")
-                .takes_value(false)
-                .help("Disables epoch boundary optimization and overrides the \
-                optimize_epoch_boundary_updates feature switch if enabled.")
-                .hidden(true),
-        )
         .after_help("The default subcommand is run")
         .subcommand(
             SubCommand::with_name("exit")
@@ -1644,6 +1681,18 @@ pub fn main() {
                 .about("Remove all authorized voters")
                 .after_help("Note: the removal only applies to the \
                              currently running validator instance")
+            )
+        )
+        .subcommand(
+            SubCommand::with_name("contact-info")
+            .about("Display the validator's contact info")
+            .arg(
+                Arg::with_name("output")
+                    .long("output")
+                    .takes_value(true)
+                    .value_name("MODE")
+                    .possible_values(&["json", "json-compact"])
+                    .help("Output display mode")
             )
         )
         .subcommand(
@@ -1772,6 +1821,26 @@ pub fn main() {
                 }
                 _ => unreachable!(),
             }
+        }
+        ("contact-info", Some(subcommand_matches)) => {
+            let output_mode = subcommand_matches.value_of("output");
+            let admin_client = admin_rpc_service::connect(&ledger_path);
+            let contact_info = admin_rpc_service::runtime()
+                .block_on(async move { admin_client.await?.contact_info().await })
+                .unwrap_or_else(|err| {
+                    eprintln!("Contact info query failed: {}", err);
+                    exit(1);
+                });
+            if let Some(mode) = output_mode {
+                match mode {
+                    "json" => println!("{}", serde_json::to_string_pretty(&contact_info).unwrap()),
+                    "json-compact" => print!("{}", serde_json::to_string(&contact_info).unwrap()),
+                    _ => unreachable!(),
+                }
+            } else {
+                print!("{}", contact_info);
+            }
+            return;
         }
         ("init", _) => Operation::Initialize,
         ("exit", Some(subcommand_matches)) => {
@@ -1907,14 +1976,13 @@ pub fn main() {
         no_genesis_fetch: matches.is_present("no_genesis_fetch"),
         no_snapshot_fetch: matches.is_present("no_snapshot_fetch"),
         no_check_vote_account: matches.is_present("no_check_vote_account"),
-        no_untrusted_rpc: matches.is_present("no_untrusted_rpc"),
+        only_known_rpc: matches.is_present("only_known_rpc"),
         max_genesis_archive_unpacked_size: value_t_or_exit!(
             matches,
             "max_genesis_archive_unpacked_size",
             u64
         ),
-        incremental_snapshot_fetch: matches.is_present("incremental_snapshots")
-            && !matches.is_present("no_incremental_snapshot_fetch"),
+        incremental_snapshot_fetch: matches.is_present("incremental_snapshots"),
     };
 
     let private_rpc = matches.is_present("private_rpc");
@@ -1946,10 +2014,10 @@ pub fn main() {
         None
     };
 
-    let trusted_validators = validators_set(
+    let known_validators = validators_set(
         &identity_keypair.pubkey(),
         &matches,
-        "trusted_validators",
+        "known_validators",
         "--known-validator",
     );
     let repair_validators = validators_set(
@@ -2082,11 +2150,20 @@ pub fn main() {
         accounts_index_config.drives = Some(accounts_index_paths);
     }
 
+    const MB: usize = 1_024 * 1_024;
+    accounts_index_config.scan_results_limit_bytes =
+        value_t!(matches, "accounts_index_scan_results_limit_mb", usize)
+            .ok()
+            .map(|mb| mb * MB);
+
     let filler_account_count = value_t!(matches, "accounts_filler_count", usize).ok();
     let mut accounts_db_config = AccountsDbConfig {
         index: Some(accounts_index_config),
         accounts_hash_cache_path: Some(ledger_path.clone()),
         filler_account_count,
+        write_cache_limit_bytes: value_t!(matches, "accounts_db_cache_limit_mb", u64)
+            .ok()
+            .map(|mb| mb * MB as u64),
         ..AccountsDbConfig::default()
     };
 
@@ -2160,6 +2237,7 @@ pub fn main() {
                 u64
             ),
             rpc_threads: value_t_or_exit!(matches, "rpc_threads", usize),
+            rpc_niceness_adj: value_t_or_exit!(matches, "rpc_niceness_adj", i8),
             rpc_bigtable_timeout: value_t!(matches, "rpc_bigtable_timeout", u64)
                 .ok()
                 .map(Duration::from_secs),
@@ -2178,6 +2256,7 @@ pub fn main() {
             )
         }),
         pubsub_config: PubSubConfig {
+            enable_block_subscription: matches.is_present("rpc_pubsub_enable_block_subscription"),
             enable_vote_subscription: matches.is_present("rpc_pubsub_enable_vote_subscription"),
             max_active_subscriptions: value_t_or_exit!(
                 matches,
@@ -2194,13 +2273,14 @@ pub fn main() {
                 "rpc_pubsub_queue_capacity_bytes",
                 usize
             ),
+            worker_threads: value_t_or_exit!(matches, "rpc_pubsub_worker_threads", usize),
+            notification_threads: value_of(&matches, "rpc_pubsub_notification_threads"),
         },
         voting_disabled: matches.is_present("no_voting") || restricted_repair_only_mode,
         wait_for_supermajority: value_t!(matches, "wait_for_supermajority", Slot).ok(),
-        trusted_validators,
+        known_validators,
         repair_validators,
         gossip_validators,
-        frozen_accounts: values_t!(matches, "frozen_accounts", Pubkey).unwrap_or_default(),
         no_rocksdb_compaction,
         rocksdb_compaction_interval,
         rocksdb_max_compaction_jitter,
@@ -2229,6 +2309,7 @@ pub fn main() {
             ),
         },
         no_poh_speed_test: matches.is_present("no_poh_speed_test"),
+        no_os_network_stats_reporting: matches.is_present("no_os_network_stats_reporting"),
         poh_pinned_cpu_core: value_of(&matches, "poh_pinned_cpu_core")
             .unwrap_or(poh_service::DEFAULT_PINNED_CPU_CORE),
         poh_hashes_per_batch: value_of(&matches, "poh_hashes_per_batch")
@@ -2242,8 +2323,6 @@ pub fn main() {
         tpu_coalesce_ms,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
         accounts_shrink_ratio,
-        disable_epoch_boundary_optimization: matches
-            .is_present("disable_epoch_boundary_optimization"),
         ..ValidatorConfig::default()
     };
 
@@ -2316,6 +2395,8 @@ pub fn main() {
         value_t_or_exit!(matches, "maximum_full_snapshots_to_retain", usize);
     let maximum_incremental_snapshot_archives_to_retain =
         value_t_or_exit!(matches, "maximum_incremental_snapshots_to_retain", usize);
+    let snapshot_packager_niceness_adj =
+        value_t_or_exit!(matches, "snapshot_packager_niceness_adj", i8);
     let minimal_snapshot_download_speed =
         value_t_or_exit!(matches, "minimal_snapshot_download_speed", f32);
     let maximum_snapshot_download_abort =
@@ -2383,6 +2464,7 @@ pub fn main() {
         maximum_incremental_snapshot_archives_to_retain,
         accounts_hash_use_index: validator_config.accounts_db_use_index_hash_calculation,
         accounts_hash_debug_verify: validator_config.accounts_db_test_hash_calculation,
+        packager_thread_niceness_adj: snapshot_packager_niceness_adj,
     });
 
     validator_config.accounts_hash_interval_slots =
@@ -2422,8 +2504,8 @@ pub fn main() {
         validator_config.max_ledger_shreds = Some(limit_ledger_size);
     }
 
-    if matches.is_present("halt_on_trusted_validators_accounts_hash_mismatch") {
-        validator_config.halt_on_trusted_validators_accounts_hash_mismatch = true;
+    if matches.is_present("halt_on_known_validators_accounts_hash_mismatch") {
+        validator_config.halt_on_known_validators_accounts_hash_mismatch = true;
     }
 
     let public_rpc_addr = matches.value_of("public_rpc_addr").map(|addr| {

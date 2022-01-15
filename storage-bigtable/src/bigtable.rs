@@ -125,6 +125,7 @@ impl BigTableConnection {
         instance_name: &str,
         read_only: bool,
         timeout: Option<Duration>,
+        credential_path: Option<String>,
     ) -> Result<Self> {
         match std::env::var("BIGTABLE_EMULATOR_HOST") {
             Ok(endpoint) => {
@@ -141,11 +142,14 @@ impl BigTableConnection {
             }
 
             Err(_) => {
-                let access_token = AccessToken::new(if read_only {
-                    Scope::BigTableDataReadOnly
-                } else {
-                    Scope::BigTableData
-                })
+                let access_token = AccessToken::new(
+                    if read_only {
+                        Scope::BigTableDataReadOnly
+                    } else {
+                        Scope::BigTableData
+                    },
+                    credential_path,
+                )
                 .await
                 .map_err(Error::AccessToken)?;
 
@@ -782,15 +786,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::StoredConfirmedBlock;
-    use prost::Message;
-    use solana_sdk::{hash::Hash, signature::Keypair, system_transaction};
-    use solana_storage_proto::convert::generated;
-    use solana_transaction_status::{
-        ConfirmedBlock, TransactionStatusMeta, TransactionWithStatusMeta,
+    use {
+        super::*,
+        crate::StoredConfirmedBlock,
+        prost::Message,
+        solana_sdk::{
+            hash::Hash, message::v0::LoadedAddresses, signature::Keypair, system_transaction,
+        },
+        solana_storage_proto::convert::generated,
+        solana_transaction_status::{
+            ConfirmedBlock, TransactionStatusMeta, TransactionWithStatusMeta,
+            VersionedConfirmedBlock,
+        },
+        std::convert::TryInto,
     };
-    use std::convert::TryInto;
 
     #[test]
     fn test_deserialize_protobuf_or_bincode_cell_data() {
@@ -809,6 +818,7 @@ mod tests {
                 pre_token_balances: Some(vec![]),
                 post_token_balances: Some(vec![]),
                 rewards: Some(vec![]),
+                loaded_addresses: LoadedAddresses::default(),
             }),
         };
         let block = ConfirmedBlock {
@@ -839,8 +849,9 @@ mod tests {
             "".to_string(),
         )
         .unwrap();
+        let expected_block: VersionedConfirmedBlock = block.into();
         if let CellData::Protobuf(protobuf_block) = deserialized {
-            assert_eq!(block, protobuf_block.try_into().unwrap());
+            assert_eq!(expected_block, protobuf_block.try_into().unwrap());
         } else {
             panic!("deserialization should produce CellData::Protobuf");
         }
@@ -855,7 +866,7 @@ mod tests {
         )
         .unwrap();
         if let CellData::Bincode(bincode_block) = deserialized {
-            let mut block = block;
+            let mut block = expected_block;
             if let Some(meta) = &mut block.transactions[0].meta {
                 meta.inner_instructions = None; // Legacy bincode implementation does not support inner_instructions
                 meta.log_messages = None; // Legacy bincode implementation does not support log_messages

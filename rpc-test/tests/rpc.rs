@@ -1,40 +1,42 @@
-use bincode::serialize;
-use jsonrpc_core::futures::StreamExt;
-use jsonrpc_core_client::transports::ws;
-
-use log::*;
-use reqwest::{self, header::CONTENT_TYPE};
-use serde_json::{json, Value};
-use solana_account_decoder::UiAccount;
-use solana_client::{
-    client_error::{ClientErrorKind, Result as ClientResult},
-    rpc_client::RpcClient,
-    rpc_config::{RpcAccountInfoConfig, RpcSignatureSubscribeConfig},
-    rpc_request::RpcError,
-    rpc_response::{Response as RpcResponse, RpcSignatureResult, SlotUpdate},
-    tpu_client::{TpuClient, TpuClientConfig},
+use {
+    bincode::serialize,
+    crossbeam_channel::unbounded,
+    jsonrpc_core::futures::StreamExt,
+    jsonrpc_core_client::transports::ws,
+    log::*,
+    reqwest::{self, header::CONTENT_TYPE},
+    serde_json::{json, Value},
+    solana_account_decoder::UiAccount,
+    solana_client::{
+        client_error::{ClientErrorKind, Result as ClientResult},
+        rpc_client::RpcClient,
+        rpc_config::{RpcAccountInfoConfig, RpcSignatureSubscribeConfig},
+        rpc_request::RpcError,
+        rpc_response::{Response as RpcResponse, RpcSignatureResult, SlotUpdate},
+        tpu_client::{TpuClient, TpuClientConfig},
+    },
+    solana_rpc::rpc_pubsub::gen_client::Client as PubsubClient,
+    solana_sdk::{
+        commitment_config::CommitmentConfig,
+        hash::Hash,
+        pubkey::Pubkey,
+        rent::Rent,
+        signature::{Keypair, Signer},
+        system_transaction,
+        transaction::Transaction,
+    },
+    solana_streamer::socket::SocketAddrSpace,
+    solana_test_validator::TestValidator,
+    solana_transaction_status::TransactionStatus,
+    std::{
+        collections::HashSet,
+        net::UdpSocket,
+        sync::Arc,
+        thread::sleep,
+        time::{Duration, Instant},
+    },
+    tokio::runtime::Runtime,
 };
-use solana_rpc::rpc_pubsub::gen_client::Client as PubsubClient;
-use solana_test_validator::TestValidator;
-
-use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    hash::Hash,
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    system_transaction,
-    transaction::Transaction,
-};
-use solana_streamer::socket::SocketAddrSpace;
-use solana_transaction_status::TransactionStatus;
-use std::{
-    collections::HashSet,
-    net::UdpSocket,
-    sync::{mpsc::channel, Arc},
-    thread::sleep,
-    time::{Duration, Instant},
-};
-use tokio::runtime::Runtime;
 
 macro_rules! json_req {
     ($method: expr, $params: expr) => {{
@@ -79,7 +81,12 @@ fn test_rpc_send_tx() {
         .unwrap();
 
     info!("blockhash: {:?}", blockhash);
-    let tx = system_transaction::transfer(&alice, &bob_pubkey, 20, blockhash);
+    let tx = system_transaction::transfer(
+        &alice,
+        &bob_pubkey,
+        Rent::default().minimum_balance(0),
+        blockhash,
+    );
     let serialized_encoded_tx = bs58::encode(serialize(&tx).unwrap()).into_string();
 
     let req = json_req!("sendTransaction", json!([serialized_encoded_tx]));
@@ -108,8 +115,9 @@ fn test_rpc_send_tx() {
 
     assert!(confirmed_tx);
 
-    use solana_account_decoder::UiAccountEncoding;
-    use solana_client::rpc_config::RpcAccountInfoConfig;
+    use {
+        solana_account_decoder::UiAccountEncoding, solana_client::rpc_config::RpcAccountInfoConfig,
+    };
     let config = RpcAccountInfoConfig {
         encoding: Some(UiAccountEncoding::Base64),
         commitment: None,
@@ -166,7 +174,7 @@ fn test_rpc_slot_updates() {
     // Create the pub sub runtime
     let rt = Runtime::new().unwrap();
     let rpc_pubsub_url = test_validator.rpc_pubsub_url();
-    let (update_sender, update_receiver) = channel::<Arc<SlotUpdate>>();
+    let (update_sender, update_receiver) = unbounded::<Arc<SlotUpdate>>();
 
     // Subscribe to slot updates
     rt.spawn(async move {
@@ -241,7 +249,7 @@ fn test_rpc_subscriptions() {
             system_transaction::transfer(
                 &alice,
                 &solana_sdk::pubkey::new_rand(),
-                1,
+                Rent::default().minimum_balance(0),
                 recent_blockhash,
             )
         })
@@ -256,11 +264,11 @@ fn test_rpc_subscriptions() {
         .collect();
 
     // Track when subscriptions are ready
-    let (ready_sender, ready_receiver) = channel::<()>();
+    let (ready_sender, ready_receiver) = unbounded::<()>();
     // Track account notifications are received
-    let (account_sender, account_receiver) = channel::<RpcResponse<UiAccount>>();
+    let (account_sender, account_receiver) = unbounded::<RpcResponse<UiAccount>>();
     // Track when status notifications are received
-    let (status_sender, status_receiver) = channel::<(String, RpcResponse<RpcSignatureResult>)>();
+    let (status_sender, status_receiver) = unbounded::<(String, RpcResponse<RpcSignatureResult>)>();
 
     // Create the pub sub runtime
     let rt = Runtime::new().unwrap();
@@ -339,16 +347,19 @@ fn test_rpc_subscriptions() {
     // Track mint balance to know when transactions have completed
     let now = Instant::now();
     let expected_mint_balance = mint_balance - transactions.len() as u64;
-    while mint_balance != expected_mint_balance && now.elapsed() < Duration::from_secs(5) {
+    while mint_balance != expected_mint_balance && now.elapsed() < Duration::from_secs(15) {
         mint_balance = rpc_client
             .get_balance_with_commitment(&alice.pubkey(), CommitmentConfig::processed())
             .unwrap()
             .value;
         sleep(Duration::from_millis(100));
     }
+    if mint_balance != expected_mint_balance {
+        error!("mint-check timeout. mint_balance {:?}", mint_balance);
+    }
 
     // Wait for all signature subscriptions
-    let deadline = Instant::now() + Duration::from_secs(7);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !signature_set.is_empty() {
         let timeout = deadline.saturating_duration_since(Instant::now());
         match status_receiver.recv_timeout(timeout) {
@@ -376,7 +387,7 @@ fn test_rpc_subscriptions() {
         let timeout = deadline.saturating_duration_since(Instant::now());
         match account_receiver.recv_timeout(timeout) {
             Ok(result) => {
-                assert_eq!(result.value.lamports, 1);
+                assert_eq!(result.value.lamports, Rent::default().minimum_balance(0));
                 account_notifications -= 1;
             }
             Err(_err) => {

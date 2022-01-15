@@ -133,6 +133,35 @@ describe('Connection', () => {
     });
   }
 
+  it('should attribute middleware fatals to the middleware', async () => {
+    let connection = new Connection(url, {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      fetchMiddleware: (_url, _options, _fetch) => {
+        throw new Error('This middleware experienced a fatal error');
+      },
+    });
+    const error = await expect(connection.getVersion()).to.be.rejectedWith(
+      'This middleware experienced a fatal error',
+    );
+    expect(error)
+      .to.be.an.instanceOf(Error)
+      .and.to.have.property('stack')
+      .that.include('fetchMiddleware');
+  });
+
+  it('should not attribute fetch errors to the middleware', async () => {
+    let connection = new Connection(url, {
+      fetchMiddleware: (url, _options, fetch) => {
+        fetch(url, 'An `Object` was expected here; this is a `TypeError`.');
+      },
+    });
+    const error = await expect(connection.getVersion()).to.be.rejected;
+    expect(error)
+      .to.be.an.instanceOf(Error)
+      .and.to.have.property('stack')
+      .that.does.not.include('fetchMiddleware');
+  });
+
   it('get account info - not found', async () => {
     const account = Keypair.generate();
 
@@ -2247,6 +2276,38 @@ describe('Connection', () => {
       return;
     }
     expect(feeCalculator.lamportsPerSignature).to.eq(5000);
+  });
+
+  it('get fee for message', async () => {
+    const accountFrom = Keypair.generate();
+    const accountTo = Keypair.generate();
+
+    const {blockhash} = await helpers.recentBlockhash({connection});
+
+    const transaction = new Transaction({
+      feePayer: accountFrom.publicKey,
+      recentBlockhash: blockhash,
+    }).add(
+      SystemProgram.transfer({
+        fromPubkey: accountFrom.publicKey,
+        toPubkey: accountTo.publicKey,
+        lamports: 10,
+      }),
+    );
+    const message = transaction.compileMessage();
+
+    await mockRpcResponse({
+      method: 'getFeeForMessage',
+      params: [
+        message.serialize().toString('base64'),
+        {commitment: 'confirmed'},
+      ],
+      value: 5000,
+      withContext: true,
+    });
+
+    const fee = (await connection.getFeeForMessage(message, 'confirmed')).value;
+    expect(fee).to.eq(5000);
   });
 
   it('get block time', async () => {

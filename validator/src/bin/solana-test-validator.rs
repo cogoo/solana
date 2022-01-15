@@ -1,5 +1,6 @@
 use {
-    clap::{crate_name, value_t, value_t_or_exit, App, Arg},
+    clap::{crate_name, value_t, value_t_or_exit, values_t_or_exit, App, Arg},
+    crossbeam_channel::unbounded,
     log::*,
     solana_clap_utils::{
         input_parsers::{pubkey_of, pubkeys_of, value_of},
@@ -24,9 +25,10 @@ use {
         system_program,
     },
     solana_streamer::socket::SocketAddrSpace,
+    solana_test_validator::*,
     solana_validator::{
         admin_rpc_service, dashboard::Dashboard, ledger_lockfile, lock_ledger, println_name_value,
-        redirect_stderr_to_file, solana_test_validator::*,
+        redirect_stderr_to_file,
     },
     std::{
         collections::HashSet,
@@ -34,7 +36,7 @@ use {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         process::exit,
-        sync::{mpsc::channel, Arc, RwLock},
+        sync::{Arc, RwLock},
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
 };
@@ -167,6 +169,19 @@ fn main() {
                 ),
         )
         .arg(
+            Arg::with_name("account")
+                .long("account")
+                .value_name("ADDRESS FILENAME.JSON")
+                .takes_value(true)
+                .number_of_values(2)
+                .multiple(true)
+                .help(
+                    "Load an account from the provided JSON file (see `solana account --help` on how to dump \
+                        an account to file). Files are searched for relatively to CWD and tests/fixtures. \
+                        If the ledger already exists then this parameter is silently ignored",
+                ),
+        )
+        .arg(
             Arg::with_name("no_bpf_jit")
                 .long("no-bpf-jit")
                 .takes_value(false)
@@ -282,6 +297,20 @@ fn main() {
                      If the ledger already exists then this parameter is silently ignored",
                 ),
         )
+        .arg(
+            Arg::with_name("accountsdb_plugin_config")
+                .long("accountsdb-plugin-config")
+                .value_name("FILE")
+                .takes_value(true)
+                .multiple(true)
+                .hidden(true)
+                .help("Specify the configuration file for the AccountsDb plugin."),
+        )
+        .arg(
+            Arg::with_name("no_accounts_db_caching")
+                .long("no-accounts-db-caching")
+                .help("Disables accounts caching"),
+        )
         .get_matches();
 
     let output = if matches.is_present("quiet") {
@@ -393,13 +422,8 @@ fn main() {
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
         faucet_port,
     ));
-    // JIT not supported on the BPF VM in Windows currently: https://github.com/solana-labs/rbpf/issues/217
-    #[cfg(target_family = "windows")]
-    let bpf_jit = false;
-    #[cfg(not(target_family = "windows"))]
-    let bpf_jit = !matches.is_present("no_bpf_jit");
 
-    let mut programs = vec![];
+    let mut programs_to_load = vec![];
     if let Some(values) = matches.values_of("bpf_program") {
         let values: Vec<&str> = values.collect::<Vec<_>>();
         for address_program in values.chunks(2) {
@@ -422,7 +446,7 @@ fn main() {
                         exit(1);
                     }
 
-                    programs.push(ProgramInfo {
+                    programs_to_load.push(ProgramInfo {
                         program_id: address,
                         loader: solana_sdk::bpf_loader::id(),
                         program_path,
@@ -433,7 +457,25 @@ fn main() {
         }
     }
 
-    let clone_accounts: HashSet<_> = pubkeys_of(&matches, "clone_account")
+    let mut accounts_to_load = vec![];
+    if let Some(values) = matches.values_of("account") {
+        let values: Vec<&str> = values.collect::<Vec<_>>();
+        for address_filename in values.chunks(2) {
+            match address_filename {
+                [address, filename] => {
+                    let address = address.parse::<Pubkey>().unwrap_or_else(|err| {
+                        println!("Error: invalid address {}: {}", address, err);
+                        exit(1);
+                    });
+
+                    accounts_to_load.push(AccountInfo { address, filename });
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    let accounts_to_clone: HashSet<_> = pubkeys_of(&matches, "clone_account")
         .map(|v| v.into_iter().collect())
         .unwrap_or_default();
 
@@ -483,7 +525,7 @@ fn main() {
     let faucet_pubkey = faucet_keypair.pubkey();
 
     if let Some(faucet_addr) = &faucet_addr {
-        let (sender, receiver) = channel();
+        let (sender, receiver) = unbounded();
         run_local_faucet_with_port(faucet_keypair, sender, None, faucet_addr.port());
         let _ = receiver.recv().expect("run faucet").unwrap_or_else(|err| {
             println!("Error: failed to start faucet: {}", err);
@@ -495,6 +537,7 @@ fn main() {
         for (name, long) in &[
             ("bpf_program", "--bpf-program"),
             ("clone_account", "--clone"),
+            ("account", "--account"),
             ("mint_address", "--mint"),
             ("slots_per_epoch", "--slots-per-epoch"),
             ("faucet_sol", "--faucet-sol"),
@@ -512,6 +555,8 @@ fn main() {
 
     let mut genesis = TestValidatorGenesis::default();
     genesis.max_ledger_shreds = value_of(&matches, "limit_ledger_size");
+    genesis.max_genesis_archive_unpacked_size = Some(u64::MAX);
+    genesis.accounts_db_caching_enabled = !matches.is_present("no_accounts_db_caching");
 
     let tower_storage = Arc::new(FileTowerStorage::new(ledger_path.clone()));
 
@@ -557,13 +602,14 @@ fn main() {
             faucet_addr,
             ..JsonRpcConfig::default()
         })
-        .bpf_jit(bpf_jit)
+        .bpf_jit(!matches.is_present("no_bpf_jit"))
         .rpc_port(rpc_port)
-        .add_programs_with_path(&programs);
+        .add_programs_with_path(&programs_to_load)
+        .add_accounts_from_json_files(&accounts_to_load);
 
-    if !clone_accounts.is_empty() {
+    if !accounts_to_clone.is_empty() {
         genesis.clone_accounts(
-            clone_accounts,
+            accounts_to_clone,
             cluster_rpc_client
                 .as_ref()
                 .expect("bug: --url argument missing?"),
@@ -598,6 +644,15 @@ fn main() {
 
     if let Some(bind_address) = bind_address {
         genesis.bind_ip_addr(bind_address);
+    }
+
+    if matches.is_present("accountsdb_plugin_config") {
+        genesis.accountsdb_plugin_config_files = Some(
+            values_t_or_exit!(matches, "accountsdb_plugin_config", String)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+        );
     }
 
     match genesis.start_with_mint_address(mint_address, socket_addr_space) {

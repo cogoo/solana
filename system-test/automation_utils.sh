@@ -5,9 +5,11 @@
 # shellcheck disable=SC1091
 # shellcheck disable=SC2034
 
+echo "DIR in system-test/automation_utils is : $( cd "$( dirname "${BASH_SOURCE[0]}" )""
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 REPO_ROOT=${DIR}/..
 
+echo "REPO_ROOT in system-test/automation_utils is : $REPO_ROOT"
 source "${REPO_ROOT}"/ci/upload-ci-artifact.sh
 
 function execution_step {
@@ -32,6 +34,7 @@ function analyze_packet_loss {
     set -x
     # shellcheck disable=SC1091
     source "${REPO_ROOT}"/net/config/config
+    cat "${REPO_ROOT}"/net/config/config
     mkdir -p iftop-logs
     execution_step "Map private -> public IP addresses in iftop logs"
     # shellcheck disable=SC2154
@@ -110,6 +113,21 @@ function get_current_stake {
     '$HOME/.cargo/bin/solana --url http://127.0.0.1:8899 validators --output=json | grep -o "totalCurrentStake\": [0-9]*" | cut -d: -f2'
 }
 
+function get_validator_confirmation_time {
+  SINCE=$1
+  declare q_mean_confirmation='
+    SELECT ROUND(MEAN("duration_ms")) as "mean_confirmation_ms"
+      FROM "'$TESTNET_TAG'"."autogen"."validator-confirmation"
+      WHERE time > now() - '"$SINCE"'s'
+
+  mean_confirmation_ms=$( \
+      curl -G "${INFLUX_HOST}/query?u=ro&p=topsecret" \
+        --data-urlencode "db=${TESTNET_TAG}" \
+        --data-urlencode "q=$q_mean_confirmation" |
+      python3 "${REPO_ROOT}"/system-test/testnet-automation-json-parser.py --empty_error |
+      cut -d' ' -f2)
+}
+
 function collect_performance_statistics {
   execution_step "Collect performance statistics about run"
   declare q_mean_tps='
@@ -185,6 +203,7 @@ function upload_results_to_slack() {
     echo "SLACK_WEBHOOOK_URL undefined"
     exit 1
   fi
+  echo "SLACK_WEBHOOOK_URL is : $SLACK_WEBHOOOK_URL"
 
   [[ -n $BUILDKITE_MESSAGE ]] || BUILDKITE_MESSAGE="Message not defined"
 
@@ -199,7 +218,7 @@ function upload_results_to_slack() {
     BUILDKITE_BUILD_URL="https://buildkite.com/solana-labs/"
   fi
 
-  GRAFANA_URL="https://metrics.solana.com:3000/d/monitor-${CHANNEL:-edge}/cluster-telemetry-${CHANNEL:-edge}?var-testnet=${TESTNET_TAG:-testnet-automation}&from=${TESTNET_START_UNIX_MSECS:-0}&to=${TESTNET_FINISH_UNIX_MSECS:-0}"
+  GRAFANA_URL="https://internal-metrics.solana.com:3000/d/monitor-${CHANNEL:-edge}/cluster-telemetry-${CHANNEL:-edge}?var-testnet=${TESTNET_TAG:-testnet-automation}&from=${TESTNET_START_UNIX_MSECS:-0}&to=${TESTNET_FINISH_UNIX_MSECS:-0}"
 
   [[ -n $RESULT_DETAILS ]] || RESULT_DETAILS="Undefined"
   [[ -n $TEST_CONFIGURATION ]] || TEST_CONFIGURATION="Undefined"

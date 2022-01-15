@@ -1,15 +1,18 @@
-use crate::blockstore::Blockstore;
-use log::*;
-use solana_measure::measure::Measure;
-use solana_sdk::clock::Slot;
-use std::{
-    collections::HashSet,
-    result::Result,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+use {
+    crate::blockstore::Blockstore,
+    crossbeam_channel::bounded,
+    log::*,
+    solana_measure::measure::Measure,
+    solana_sdk::clock::Slot,
+    std::{
+        collections::HashSet,
+        result::Result,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
     },
-    time::Duration,
 };
 
 // Attempt to upload this many blocks in parallel
@@ -128,7 +131,7 @@ pub async fn upload_confirmed_blocks(
     let (_loader_thread, receiver) = {
         let exit = exit.clone();
 
-        let (sender, receiver) = std::sync::mpsc::sync_channel(BLOCK_READ_AHEAD_DEPTH);
+        let (sender, receiver) = bounded(BLOCK_READ_AHEAD_DEPTH);
         (
             std::thread::spawn(move || {
                 let mut measure = Measure::start("block loader thread");

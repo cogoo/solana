@@ -1,6 +1,7 @@
 //! The `net_utils` module assists with networking
 #![allow(clippy::integer_arithmetic)]
 use {
+    crossbeam_channel::unbounded,
     log::*,
     rand::{thread_rng, Rng},
     socket2::{Domain, SockAddr, Socket, Type},
@@ -8,7 +9,7 @@ use {
         collections::{BTreeMap, HashSet},
         io::{self, Read, Write},
         net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
-        sync::{mpsc::channel, Arc, RwLock},
+        sync::{Arc, RwLock},
         time::{Duration, Instant},
     },
     url::Url,
@@ -138,7 +139,7 @@ fn do_verify_reachable_ports(
 
     // Wait for a connection to open on each TCP port
     for (port, tcp_listener) in tcp_listeners {
-        let (sender, receiver) = channel();
+        let (sender, receiver) = unbounded();
         let listening_addr = tcp_listener.local_addr().unwrap();
         let thread_handle = std::thread::spawn(move || {
             debug!("Waiting for incoming connection on tcp/{}", port);
@@ -372,17 +373,21 @@ pub fn is_host_port(string: String) -> Result<(), String> {
     parse_host_port(&string).map(|_| ())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "ios"))]
 fn udp_socket(_reuseaddr: bool) -> io::Result<Socket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
     Ok(sock)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 fn udp_socket(reuseaddr: bool) -> io::Result<Socket> {
-    use nix::sys::socket::setsockopt;
-    use nix::sys::socket::sockopt::{ReuseAddr, ReusePort};
-    use std::os::unix::io::AsRawFd;
+    use {
+        nix::sys::socket::{
+            setsockopt,
+            sockopt::{ReuseAddr, ReusePort},
+        },
+        std::os::unix::io::AsRawFd,
+    };
 
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
     let sock_fd = sock.as_raw_fd();
@@ -524,8 +529,7 @@ pub fn find_available_port_in_range(ip_addr: IpAddr, range: PortRange) -> io::Re
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::net::Ipv4Addr;
+    use {super::*, std::net::Ipv4Addr};
 
     #[test]
     fn test_response_length() {

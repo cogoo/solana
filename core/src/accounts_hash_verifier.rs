@@ -1,33 +1,35 @@
-// Service to verify accounts hashes with other trusted validator nodes.
+// Service to verify accounts hashes with other known validator nodes.
 //
 // Each interval, publish the snapshat hash which is the full accounts state
 // hash on gossip. Monitor gossip for messages from validators in the `--known-validator`s
 // set and halt the node if a mismatch is detected.
 
-use rayon::ThreadPool;
-use solana_gossip::cluster_info::{ClusterInfo, MAX_SNAPSHOT_HASHES};
-use solana_measure::measure::Measure;
-use solana_runtime::{
-    accounts_db::{self, AccountsDb},
-    accounts_hash::HashStats,
-    snapshot_config::SnapshotConfig,
-    snapshot_package::{
-        AccountsPackage, AccountsPackageReceiver, PendingSnapshotPackage, SnapshotPackage,
-        SnapshotType,
+use {
+    crossbeam_channel::RecvTimeoutError,
+    rayon::ThreadPool,
+    solana_gossip::cluster_info::{ClusterInfo, MAX_SNAPSHOT_HASHES},
+    solana_measure::measure::Measure,
+    solana_runtime::{
+        accounts_db::{self, AccountsDb},
+        accounts_hash::HashStats,
+        snapshot_config::SnapshotConfig,
+        snapshot_package::{
+            AccountsPackage, AccountsPackageReceiver, PendingSnapshotPackage, SnapshotPackage,
+            SnapshotType,
+        },
+        sorted_storages::SortedStorages,
     },
-    sorted_storages::SortedStorages,
-};
-use solana_sdk::{clock::Slot, hash::Hash, pubkey::Pubkey};
-use std::collections::{HashMap, HashSet};
-use std::{
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::RecvTimeoutError,
-        Arc,
+    solana_sdk::{clock::Slot, hash::Hash, pubkey::Pubkey},
+    std::{
+        collections::{HashMap, HashSet},
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread::{self, Builder, JoinHandle},
+        time::Duration,
     },
-    thread::{self, Builder, JoinHandle},
-    time::Duration,
 };
 
 pub struct AccountsHashVerifier {
@@ -40,8 +42,8 @@ impl AccountsHashVerifier {
         pending_snapshot_package: Option<PendingSnapshotPackage>,
         exit: &Arc<AtomicBool>,
         cluster_info: &Arc<ClusterInfo>,
-        trusted_validators: Option<HashSet<Pubkey>>,
-        halt_on_trusted_validators_accounts_hash_mismatch: bool,
+        known_validators: Option<HashSet<Pubkey>>,
+        halt_on_known_validators_accounts_hash_mismatch: bool,
         fault_injection_rate_slots: u64,
         snapshot_config: Option<SnapshotConfig>,
         ledger_path: PathBuf,
@@ -68,8 +70,8 @@ impl AccountsHashVerifier {
                             Self::process_accounts_package(
                                 accounts_package,
                                 &cluster_info,
-                                trusted_validators.as_ref(),
-                                halt_on_trusted_validators_accounts_hash_mismatch,
+                                known_validators.as_ref(),
+                                halt_on_known_validators_accounts_hash_mismatch,
                                 pending_snapshot_package.as_ref(),
                                 &mut hashes,
                                 &exit,
@@ -94,8 +96,8 @@ impl AccountsHashVerifier {
     fn process_accounts_package(
         accounts_package: AccountsPackage,
         cluster_info: &ClusterInfo,
-        trusted_validators: Option<&HashSet<Pubkey>>,
-        halt_on_trusted_validator_accounts_hash_mismatch: bool,
+        known_validators: Option<&HashSet<Pubkey>>,
+        halt_on_known_validator_accounts_hash_mismatch: bool,
         pending_snapshot_package: Option<&PendingSnapshotPackage>,
         hashes: &mut Vec<(Slot, Hash)>,
         exit: &Arc<AtomicBool>,
@@ -109,8 +111,8 @@ impl AccountsHashVerifier {
         Self::push_accounts_hashes_to_cluster(
             &accounts_package,
             cluster_info,
-            trusted_validators,
-            halt_on_trusted_validator_accounts_hash_mismatch,
+            known_validators,
+            halt_on_known_validator_accounts_hash_mismatch,
             hashes,
             exit,
             fault_injection_rate_slots,
@@ -152,8 +154,8 @@ impl AccountsHashVerifier {
     fn push_accounts_hashes_to_cluster(
         accounts_package: &AccountsPackage,
         cluster_info: &ClusterInfo,
-        trusted_validators: Option<&HashSet<Pubkey>>,
-        halt_on_trusted_validator_accounts_hash_mismatch: bool,
+        known_validators: Option<&HashSet<Pubkey>>,
+        halt_on_known_validator_accounts_hash_mismatch: bool,
         hashes: &mut Vec<(Slot, Hash)>,
         exit: &Arc<AtomicBool>,
         fault_injection_rate_slots: u64,
@@ -163,8 +165,10 @@ impl AccountsHashVerifier {
             && accounts_package.slot % fault_injection_rate_slots == 0
         {
             // For testing, publish an invalid hash to gossip.
-            use rand::{thread_rng, Rng};
-            use solana_sdk::hash::extend_and_hash;
+            use {
+                rand::{thread_rng, Rng},
+                solana_sdk::hash::extend_and_hash,
+            };
             warn!("inserting fault at slot: {}", accounts_package.slot);
             let rand = thread_rng().gen_range(0, 10);
             let hash = extend_and_hash(&hash, &[rand]);
@@ -177,12 +181,12 @@ impl AccountsHashVerifier {
             hashes.remove(0);
         }
 
-        if halt_on_trusted_validator_accounts_hash_mismatch {
+        if halt_on_known_validator_accounts_hash_mismatch {
             let mut slot_to_hash = HashMap::new();
             for (slot, hash) in hashes.iter() {
                 slot_to_hash.insert(*slot, *hash);
             }
-            if Self::should_halt(cluster_info, trusted_validators, &mut slot_to_hash) {
+            if Self::should_halt(cluster_info, known_validators, &mut slot_to_hash) {
                 exit.store(true, Ordering::Relaxed);
             }
         }
@@ -226,20 +230,20 @@ impl AccountsHashVerifier {
 
     fn should_halt(
         cluster_info: &ClusterInfo,
-        trusted_validators: Option<&HashSet<Pubkey>>,
+        known_validators: Option<&HashSet<Pubkey>>,
         slot_to_hash: &mut HashMap<Slot, Hash>,
     ) -> bool {
         let mut verified_count = 0;
         let mut highest_slot = 0;
-        if let Some(trusted_validators) = trusted_validators {
-            for trusted_validator in trusted_validators {
-                let is_conflicting = cluster_info.get_accounts_hash_for_node(trusted_validator, |accounts_hashes|
+        if let Some(known_validators) = known_validators {
+            for known_validator in known_validators {
+                let is_conflicting = cluster_info.get_accounts_hash_for_node(known_validator, |accounts_hashes|
                 {
                     accounts_hashes.iter().any(|(slot, hash)| {
                         if let Some(reference_hash) = slot_to_hash.get(slot) {
                             if *hash != *reference_hash {
-                                error!("Trusted validator {} produced conflicting hashes for slot: {} ({} != {})",
-                                    trusted_validator,
+                                error!("Known validator {} produced conflicting hashes for slot: {} ({} != {})",
+                                    known_validator,
                                     slot,
                                     hash,
                                     reference_hash,
@@ -277,15 +281,17 @@ impl AccountsHashVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use solana_gossip::{cluster_info::make_accounts_hashes_message, contact_info::ContactInfo};
-    use solana_runtime::snapshot_utils::{ArchiveFormat, SnapshotVersion};
-    use solana_sdk::{
-        genesis_config::ClusterType,
-        hash::hash,
-        signature::{Keypair, Signer},
+    use {
+        super::*,
+        solana_gossip::{cluster_info::make_accounts_hashes_message, contact_info::ContactInfo},
+        solana_runtime::snapshot_utils::{ArchiveFormat, SnapshotVersion},
+        solana_sdk::{
+            genesis_config::ClusterType,
+            hash::hash,
+            signature::{Keypair, Signer},
+        },
+        solana_streamer::socket::SocketAddrSpace,
     };
-    use solana_streamer::socket::SocketAddrSpace;
 
     fn new_test_cluster_info(contact_info: ContactInfo) -> ClusterInfo {
         ClusterInfo::new(
@@ -303,11 +309,11 @@ mod tests {
         let cluster_info = new_test_cluster_info(contact_info);
         let cluster_info = Arc::new(cluster_info);
 
-        let mut trusted_validators = HashSet::new();
+        let mut known_validators = HashSet::new();
         let mut slot_to_hash = HashMap::new();
         assert!(!AccountsHashVerifier::should_halt(
             &cluster_info,
-            Some(&trusted_validators),
+            Some(&known_validators),
             &mut slot_to_hash,
         ));
 
@@ -320,10 +326,10 @@ mod tests {
             cluster_info.flush_push_queue();
         }
         slot_to_hash.insert(0, hash2);
-        trusted_validators.insert(validator1.pubkey());
+        known_validators.insert(validator1.pubkey());
         assert!(AccountsHashVerifier::should_halt(
             &cluster_info,
-            Some(&trusted_validators),
+            Some(&known_validators),
             &mut slot_to_hash,
         ));
     }
@@ -331,15 +337,14 @@ mod tests {
     #[test]
     fn test_max_hashes() {
         solana_logger::setup();
-        use std::path::PathBuf;
-        use tempfile::TempDir;
+        use {std::path::PathBuf, tempfile::TempDir};
         let keypair = Keypair::new();
 
         let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), 0);
         let cluster_info = new_test_cluster_info(contact_info);
         let cluster_info = Arc::new(cluster_info);
 
-        let trusted_validators = HashSet::new();
+        let known_validators = HashSet::new();
         let exit = Arc::new(AtomicBool::new(false));
         let mut hashes = vec![];
         let full_snapshot_archive_interval_slots = 100;
@@ -370,7 +375,7 @@ mod tests {
             AccountsHashVerifier::process_accounts_package(
                 accounts_package,
                 &cluster_info,
-                Some(&trusted_validators),
+                Some(&known_validators),
                 false,
                 None,
                 &mut hashes,

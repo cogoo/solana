@@ -3,22 +3,23 @@
 
 extern crate test;
 
-use log::*;
-use solana_runtime::{bank::*, bank_client::BankClient, loader_utils::create_invoke_instruction};
-use solana_sdk::{
-    client::AsyncClient,
-    client::SyncClient,
-    clock::MAX_RECENT_BLOCKHASHES,
-    genesis_config::create_genesis_config,
-    instruction::InstructionError,
-    message::Message,
-    process_instruction::InvokeContext,
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::Transaction,
+use {
+    log::*,
+    solana_program_runtime::invoke_context::InvokeContext,
+    solana_runtime::{bank::*, bank_client::BankClient, loader_utils::create_invoke_instruction},
+    solana_sdk::{
+        client::{AsyncClient, SyncClient},
+        clock::MAX_RECENT_BLOCKHASHES,
+        genesis_config::create_genesis_config,
+        instruction::InstructionError,
+        message::Message,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    },
+    std::{sync::Arc, thread::sleep, time::Duration},
+    test::Bencher,
 };
-use std::{sync::Arc, thread::sleep, time::Duration};
-use test::Bencher;
 
 const BUILTIN_PROGRAM_ID: [u8; 32] = [
     98, 117, 105, 108, 116, 105, 110, 95, 112, 114, 111, 103, 114, 97, 109, 95, 105, 100, 0, 0, 0,
@@ -34,7 +35,7 @@ const NOOP_PROGRAM_ID: [u8; 32] = [
 fn process_instruction(
     _first_instruction_account: usize,
     _data: &[u8],
-    _invoke_context: &mut dyn InvokeContext,
+    _invoke_context: &mut InvokeContext,
 ) -> Result<(), InstructionError> {
     Ok(())
 }
@@ -122,9 +123,14 @@ fn do_bench_transactions(
 ) {
     solana_logger::setup();
     let ns_per_s = 1_000_000_000;
-    let (mut genesis_config, mint_keypair) = create_genesis_config(100_000_000);
+    let (mut genesis_config, mint_keypair) = create_genesis_config(100_000_000_000_000);
     genesis_config.ticks_per_slot = 100;
-    let mut bank = Bank::new_for_benches(&genesis_config);
+
+    let bank = Bank::new_for_benches(&genesis_config);
+    // freeze bank so that slot hashes is populated
+    bank.freeze();
+
+    let mut bank = Bank::new_from_parent(&Arc::new(bank), &Pubkey::default(), 1);
     bank.add_builtin(
         "builtin_program",
         &Pubkey::new(&BUILTIN_PROGRAM_ID),

@@ -2,20 +2,22 @@
 use {
     log::*,
     serde::{Deserialize, Serialize},
+    solana_metrics::inc_new_counter_debug,
     solana_sdk::{
         clock::{Slot, UnixTimestamp},
         deserialize_utils::default_on_eof,
+        message::v0::LoadedAddresses,
         pubkey::Pubkey,
         signature::Signature,
         sysvar::is_sysvar_id,
-        transaction::{Transaction, TransactionError},
+        transaction::{TransactionError, VersionedTransaction},
     },
     solana_storage_proto::convert::{generated, tx_by_addr},
     solana_transaction_status::{
-        extract_and_fmt_memos, ConfirmedBlock, ConfirmedTransaction,
-        ConfirmedTransactionStatusWithSignature, Reward, TransactionByAddrInfo,
-        TransactionConfirmationStatus, TransactionStatus, TransactionStatusMeta,
-        TransactionWithStatusMeta,
+        extract_and_fmt_memos, ConfirmedBlock, ConfirmedTransactionStatusWithSignature, Reward,
+        TransactionByAddrInfo, TransactionConfirmationStatus, TransactionStatus,
+        TransactionStatusMeta, TransactionWithStatusMeta, VersionedConfirmedBlock,
+        VersionedConfirmedTransactionWithStatusMeta, VersionedTransactionWithStatusMeta,
     },
     std::{
         collections::{HashMap, HashSet},
@@ -23,6 +25,9 @@ use {
     },
     thiserror::Error,
 };
+
+#[macro_use]
+extern crate solana_metrics;
 
 #[macro_use]
 extern crate serde_derive;
@@ -134,7 +139,7 @@ impl From<ConfirmedBlock> for StoredConfirmedBlock {
     }
 }
 
-impl From<StoredConfirmedBlock> for ConfirmedBlock {
+impl From<StoredConfirmedBlock> for VersionedConfirmedBlock {
     fn from(confirmed_block: StoredConfirmedBlock) -> Self {
         let StoredConfirmedBlock {
             previous_blockhash,
@@ -160,20 +165,20 @@ impl From<StoredConfirmedBlock> for ConfirmedBlock {
 
 #[derive(Serialize, Deserialize)]
 struct StoredConfirmedBlockTransaction {
-    transaction: Transaction,
+    transaction: VersionedTransaction,
     meta: Option<StoredConfirmedBlockTransactionStatusMeta>,
 }
 
 impl From<TransactionWithStatusMeta> for StoredConfirmedBlockTransaction {
     fn from(value: TransactionWithStatusMeta) -> Self {
         Self {
-            transaction: value.transaction,
+            transaction: value.transaction.into(),
             meta: value.meta.map(|meta| meta.into()),
         }
     }
 }
 
-impl From<StoredConfirmedBlockTransaction> for TransactionWithStatusMeta {
+impl From<StoredConfirmedBlockTransaction> for VersionedTransactionWithStatusMeta {
     fn from(value: StoredConfirmedBlockTransaction) -> Self {
         Self {
             transaction: value.transaction,
@@ -212,6 +217,7 @@ impl From<StoredConfirmedBlockTransactionStatusMeta> for TransactionStatusMeta {
             pre_token_balances: None,
             post_token_balances: None,
             rewards: None,
+            loaded_addresses: LoadedAddresses::default(),
         }
     }
 }
@@ -341,14 +347,21 @@ pub struct LedgerStorage {
 }
 
 impl LedgerStorage {
-    pub async fn new(read_only: bool, timeout: Option<std::time::Duration>) -> Result<Self> {
+    pub async fn new(
+        read_only: bool,
+        timeout: Option<std::time::Duration>,
+        credential_path: Option<String>,
+    ) -> Result<Self> {
         let connection =
-            bigtable::BigTableConnection::new("solana-ledger", read_only, timeout).await?;
+            bigtable::BigTableConnection::new("solana-ledger", read_only, timeout, credential_path)
+                .await?;
         Ok(Self { connection })
     }
 
     /// Return the available slot that contains a block
     pub async fn get_first_available_block(&self) -> Result<Option<Slot>> {
+        debug!("LedgerStorage::get_first_available_block request received");
+        inc_new_counter_debug!("storage-bigtable-query", 1);
         let mut bigtable = self.connection.client();
         let blocks = bigtable.get_row_keys("blocks", None, None, 1).await?;
         if blocks.is_empty() {
@@ -363,6 +376,11 @@ impl LedgerStorage {
     /// limit: stop after this many slots have been found; if limit==0, all records in the table
     /// after start_slot will be read
     pub async fn get_confirmed_blocks(&self, start_slot: Slot, limit: usize) -> Result<Vec<Slot>> {
+        debug!(
+            "LedgerStorage::get_confirmed_blocks request received: {:?} {:?}",
+            start_slot, limit
+        );
+        inc_new_counter_debug!("storage-bigtable-query", 1);
         let mut bigtable = self.connection.client();
         let blocks = bigtable
             .get_row_keys(
@@ -376,7 +394,12 @@ impl LedgerStorage {
     }
 
     /// Fetch the confirmed block from the desired slot
-    pub async fn get_confirmed_block(&self, slot: Slot) -> Result<ConfirmedBlock> {
+    pub async fn get_confirmed_block(&self, slot: Slot) -> Result<VersionedConfirmedBlock> {
+        debug!(
+            "LedgerStorage::get_confirmed_block request received: {:?}",
+            slot
+        );
+        inc_new_counter_debug!("storage-bigtable-query", 1);
         let mut bigtable = self.connection.client();
         let block_cell_data = bigtable
             .get_protobuf_or_bincode_cell::<StoredConfirmedBlock, generated::ConfirmedBlock>(
@@ -397,6 +420,11 @@ impl LedgerStorage {
     }
 
     pub async fn get_signature_status(&self, signature: &Signature) -> Result<TransactionStatus> {
+        debug!(
+            "LedgerStorage::get_signature_status request received: {:?}",
+            signature
+        );
+        inc_new_counter_debug!("storage-bigtable-query", 1);
         let mut bigtable = self.connection.client();
         let transaction_info = bigtable
             .get_bincode_cell::<TransactionInfo>("tx", signature.to_string())
@@ -412,7 +440,12 @@ impl LedgerStorage {
     pub async fn get_confirmed_transaction(
         &self,
         signature: &Signature,
-    ) -> Result<Option<ConfirmedTransaction>> {
+    ) -> Result<Option<VersionedConfirmedTransactionWithStatusMeta>> {
+        debug!(
+            "LedgerStorage::get_confirmed_transaction request received: {:?}",
+            signature
+        );
+        inc_new_counter_debug!("storage-bigtable-query", 1);
         let mut bigtable = self.connection.client();
 
         // Figure out which block the transaction is located in
@@ -440,9 +473,9 @@ impl LedgerStorage {
                     );
                     Ok(None)
                 } else {
-                    Ok(Some(ConfirmedTransaction {
+                    Ok(Some(VersionedConfirmedTransactionWithStatusMeta {
                         slot,
-                        transaction: bucket_block_transaction,
+                        tx_with_meta: bucket_block_transaction,
                         block_time: block.block_time,
                     }))
                 }
@@ -468,6 +501,11 @@ impl LedgerStorage {
             u32, /*slot index*/
         )>,
     > {
+        debug!(
+            "LedgerStorage::get_confirmed_signatures_for_address request received: {:?}",
+            address
+        );
+        inc_new_counter_debug!("storage-bigtable-query", 1);
         let mut bigtable = self.connection.client();
         let address_prefix = format!("{}/", address);
 
@@ -591,7 +629,7 @@ impl LedgerStorage {
     pub async fn upload_confirmed_block(
         &self,
         slot: Slot,
-        confirmed_block: ConfirmedBlock,
+        confirmed_block: VersionedConfirmedBlock,
     ) -> Result<()> {
         let mut bytes_written = 0;
 
@@ -599,13 +637,13 @@ impl LedgerStorage {
 
         let mut tx_cells = vec![];
         for (index, transaction_with_meta) in confirmed_block.transactions.iter().enumerate() {
-            let TransactionWithStatusMeta { meta, transaction } = transaction_with_meta;
+            let VersionedTransactionWithStatusMeta { meta, transaction } = transaction_with_meta;
             let err = meta.as_ref().and_then(|meta| meta.status.clone().err());
             let index = index as u32;
             let signature = transaction.signatures[0];
-            let memo = extract_and_fmt_memos(&transaction.message);
+            let memo = extract_and_fmt_memos(transaction_with_meta);
 
-            for address in &transaction.message.account_keys {
+            for address in transaction_with_meta.account_keys_iter() {
                 if !is_sysvar_id(address) {
                     by_addr
                         .entry(address)
@@ -687,12 +725,12 @@ impl LedgerStorage {
         let mut expected_tx_infos: HashMap<String, UploadedTransaction> = HashMap::new();
         let confirmed_block = self.get_confirmed_block(slot).await?;
         for (index, transaction_with_meta) in confirmed_block.transactions.iter().enumerate() {
-            let TransactionWithStatusMeta { meta, transaction } = transaction_with_meta;
+            let VersionedTransactionWithStatusMeta { transaction, meta } = transaction_with_meta;
             let signature = transaction.signatures[0];
             let index = index as u32;
             let err = meta.as_ref().and_then(|meta| meta.status.clone().err());
 
-            for address in &transaction.message.account_keys {
+            for address in transaction_with_meta.account_keys_iter() {
                 if !is_sysvar_id(address) {
                     addresses.insert(address);
                 }

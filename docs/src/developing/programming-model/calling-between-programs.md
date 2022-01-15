@@ -57,9 +57,7 @@ given instruction to the `token` program via the instruction's `program_id`
 field.
 
 Note that `invoke` requires the caller to pass all the accounts required by the
-instruction being invoked. This means that both the executable account (the
-ones that matches the instruction's program id) and the accounts passed to the
-instruction processor.
+instruction being invoked, except for the executable account (the `program_id`).
 
 Before invoking `pay()`, the runtime must ensure that `acme` didn't modify any
 accounts owned by `token`. It does this by applying the runtime's policy to the
@@ -84,8 +82,10 @@ signers and writable accounts. For example, if the instruction the caller is
 processing contains a signer or writable account, then the caller can invoke an
 instruction that also contains that signer and/or writable account.
 
-This privilege extension relies on the fact that programs are immutable. In the
-case of the `acme` program, the runtime can safely treat the transaction's
+This privilege extension relies on the fact that programs are immutable, except
+during the special case of program upgrades.
+
+In the case of the `acme` program, the runtime can safely treat the transaction's
 signature as a signature of a `token` instruction. When the runtime sees the
 `token` instruction references `alice_pubkey`, it looks up the key in the `acme`
 instruction to see if that key corresponds to a signed account. In this case, it

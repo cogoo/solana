@@ -2,12 +2,18 @@ use {
     crate::{
         accounts_update_notifier::AccountsUpdateNotifierImpl,
         accountsdb_plugin_manager::AccountsDbPluginManager,
-        slot_status_observer::SlotStatusObserver,
+        block_metadata_notifier::BlockMetadataNotifierImpl,
+        block_metadata_notifier_interface::BlockMetadataNotifierLock,
+        slot_status_notifier::SlotStatusNotifierImpl, slot_status_observer::SlotStatusObserver,
+        transaction_notifier::TransactionNotifierImpl,
     },
     crossbeam_channel::Receiver,
     log::*,
     serde_json,
-    solana_rpc::optimistically_confirmed_bank_tracker::BankNotification,
+    solana_rpc::{
+        optimistically_confirmed_bank_tracker::BankNotification,
+        transaction_notifier_interface::TransactionNotifierLock,
+    },
     solana_runtime::accounts_update_notifier_interface::AccountsUpdateNotifier,
     std::{
         fs::File,
@@ -42,9 +48,11 @@ pub enum AccountsdbPluginServiceError {
 
 /// The service managing the AccountsDb plugin workflow.
 pub struct AccountsDbPluginService {
-    slot_status_observer: SlotStatusObserver,
+    slot_status_observer: Option<SlotStatusObserver>,
     plugin_manager: Arc<RwLock<AccountsDbPluginManager>>,
-    accounts_update_notifier: AccountsUpdateNotifier,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
+    transaction_notifier: Option<TransactionNotifierLock>,
+    block_metadata_notifier: Option<BlockMetadataNotifierLock>,
 }
 
 impl AccountsDbPluginService {
@@ -74,19 +82,55 @@ impl AccountsDbPluginService {
         for accountsdb_plugin_config_file in accountsdb_plugin_config_files {
             Self::load_plugin(&mut plugin_manager, accountsdb_plugin_config_file)?;
         }
+        let account_data_notifications_enabled =
+            plugin_manager.account_data_notifications_enabled();
+        let transaction_notifications_enabled = plugin_manager.transaction_notifications_enabled();
 
         let plugin_manager = Arc::new(RwLock::new(plugin_manager));
-        let accounts_update_notifier = Arc::new(RwLock::new(AccountsUpdateNotifierImpl::new(
-            plugin_manager.clone(),
-        )));
-        let slot_status_observer =
-            SlotStatusObserver::new(confirmed_bank_receiver, accounts_update_notifier.clone());
+
+        let accounts_update_notifier: Option<AccountsUpdateNotifier> =
+            if account_data_notifications_enabled {
+                let accounts_update_notifier =
+                    AccountsUpdateNotifierImpl::new(plugin_manager.clone());
+                Some(Arc::new(RwLock::new(accounts_update_notifier)))
+            } else {
+                None
+            };
+
+        let transaction_notifier: Option<TransactionNotifierLock> =
+            if transaction_notifications_enabled {
+                let transaction_notifier = TransactionNotifierImpl::new(plugin_manager.clone());
+                Some(Arc::new(RwLock::new(transaction_notifier)))
+            } else {
+                None
+            };
+
+        let (slot_status_observer, block_metadata_notifier): (
+            Option<SlotStatusObserver>,
+            Option<BlockMetadataNotifierLock>,
+        ) = if account_data_notifications_enabled || transaction_notifications_enabled {
+            let slot_status_notifier = SlotStatusNotifierImpl::new(plugin_manager.clone());
+            let slot_status_notifier = Arc::new(RwLock::new(slot_status_notifier));
+            (
+                Some(SlotStatusObserver::new(
+                    confirmed_bank_receiver,
+                    slot_status_notifier,
+                )),
+                Some(Arc::new(RwLock::new(BlockMetadataNotifierImpl::new(
+                    plugin_manager.clone(),
+                )))),
+            )
+        } else {
+            (None, None)
+        };
 
         info!("Started AccountsDbPluginService");
         Ok(AccountsDbPluginService {
             slot_status_observer,
             plugin_manager,
             accounts_update_notifier,
+            transaction_notifier,
+            block_metadata_notifier,
         })
     }
 
@@ -145,12 +189,22 @@ impl AccountsDbPluginService {
         Ok(())
     }
 
-    pub fn get_accounts_update_notifier(&self) -> AccountsUpdateNotifier {
+    pub fn get_accounts_update_notifier(&self) -> Option<AccountsUpdateNotifier> {
         self.accounts_update_notifier.clone()
     }
 
-    pub fn join(mut self) -> thread::Result<()> {
-        self.slot_status_observer.join()?;
+    pub fn get_transaction_notifier(&self) -> Option<TransactionNotifierLock> {
+        self.transaction_notifier.clone()
+    }
+
+    pub fn get_block_metadata_notifier(&self) -> Option<BlockMetadataNotifierLock> {
+        self.block_metadata_notifier.clone()
+    }
+
+    pub fn join(self) -> thread::Result<()> {
+        if let Some(mut slot_status_observer) = self.slot_status_observer {
+            slot_status_observer.join()?;
+        }
         self.plugin_manager.write().unwrap().unload();
         Ok(())
     }

@@ -1,5 +1,7 @@
 #![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
 #![allow(clippy::integer_arithmetic)]
+pub mod account_info;
+pub mod account_rent_state;
 pub mod accounts;
 pub mod accounts_background_service;
 pub mod accounts_cache;
@@ -31,12 +33,9 @@ pub mod execute_cost_table;
 pub mod genesis_utils;
 pub mod hardened_unpack;
 pub mod in_mem_accounts_index;
-pub mod inline_spl_token_v2_0;
-pub mod instruction_recorder;
+pub mod inline_spl_token;
 pub mod loader_utils;
-pub mod log_collector;
 pub mod message_processor;
-pub mod neon_evm_program;
 pub mod non_circulating_supply;
 mod nonce_keyed_account;
 mod pubkey_bins;
@@ -51,11 +50,14 @@ pub mod snapshot_hash;
 pub mod snapshot_package;
 pub mod snapshot_utils;
 pub mod sorted_storages;
+pub mod stake_delegations;
+pub mod stake_history;
 pub mod stake_weighted_timestamp;
 pub mod stakes;
 pub mod status_cache;
 mod system_instruction_processor;
 pub mod transaction_batch;
+pub mod transaction_cost_metrics_sender;
 pub mod vote_account;
 pub mod vote_sender_types;
 pub mod waitable_condvar;

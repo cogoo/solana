@@ -1,12 +1,15 @@
-use crate::{
-    account::{from_account, AccountSharedData, ReadableAccount},
-    account_utils::{State, StateMut},
-};
-use solana_program::{clock::Epoch, instruction::InstructionError, pubkey::Pubkey, sysvar::Sysvar};
-use std::{
-    cell::{Ref, RefCell, RefMut},
-    iter::FromIterator,
-    rc::Rc,
+use {
+    crate::{
+        account::{from_account, AccountSharedData, ReadableAccount},
+        account_utils::{State, StateMut},
+    },
+    solana_program::{clock::Epoch, instruction::InstructionError, pubkey::Pubkey, sysvar::Sysvar},
+    std::{
+        cell::{Ref, RefCell, RefMut},
+        iter::FromIterator,
+        ops::Deref,
+        rc::Rc,
+    },
 };
 
 #[repr(C)]
@@ -246,24 +249,32 @@ where
     }
 }
 
-pub fn from_keyed_account<S: Sysvar>(
-    keyed_account: &crate::keyed_account::KeyedAccount,
-) -> Result<S, InstructionError> {
+pub fn check_sysvar_keyed_account<'a, S: Sysvar>(
+    keyed_account: &'a crate::keyed_account::KeyedAccount<'_>,
+) -> Result<impl Deref<Target = AccountSharedData> + 'a, InstructionError> {
     if !S::check_id(keyed_account.unsigned_key()) {
         return Err(InstructionError::InvalidArgument);
     }
-    from_account::<S, AccountSharedData>(&*keyed_account.try_account_ref()?)
-        .ok_or(InstructionError::InvalidArgument)
+    keyed_account.try_account_ref()
+}
+
+pub fn from_keyed_account<S: Sysvar>(
+    keyed_account: &crate::keyed_account::KeyedAccount,
+) -> Result<S, InstructionError> {
+    let sysvar_account = check_sysvar_keyed_account::<S>(keyed_account)?;
+    from_account::<S, AccountSharedData>(&*sysvar_account).ok_or(InstructionError::InvalidArgument)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        account::{create_account_for_test, to_account},
-        pubkey::Pubkey,
+    use {
+        super::*,
+        crate::{
+            account::{create_account_for_test, to_account},
+            pubkey::Pubkey,
+        },
+        std::cell::RefCell,
     };
-    use std::cell::RefCell;
 
     #[repr(C)]
     #[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
